@@ -1,0 +1,122 @@
+{
+  "total_samples": 6173,
+  "top1_satay": 0.1948809330957395,
+  "top1_yolo": 0.1558399481613478,
+  "delta": 0.039040984934391704,
+  "map50": 0.21729628855522165,
+  "precision": 0.1948809330957395,
+  "per_task": {
+    "1": {
+      "task_name": "Step on something",
+      "total": 486,
+      "satay_correct": 95,
+      "yolo_correct": 81,
+      "satay_acc": 0.19547325102880658,
+      "yolo_acc": 0.16666666666666666
+    },
+    "2": {
+      "task_name": "Sit comfortably",
+      "total": 660,
+      "satay_correct": 168,
+      "yolo_correct": 155,
+      "satay_acc": 0.2545454545454545,
+      "yolo_acc": 0.23484848484848486
+    },
+    "3": {
+      "task_name": "Place flowers",
+      "total": 411,
+      "satay_correct": 92,
+      "yolo_correct": 102,
+      "satay_acc": 0.22384428223844283,
+      "yolo_acc": 0.24817518248175183
+    },
+    "4": {
+      "task_name": "Get potatoes out of fire",
+      "total": 639,
+      "satay_correct": 111,
+      "yolo_correct": 73,
+      "satay_acc": 0.17370892018779344,
+      "yolo_acc": 0.11424100156494522
+    },
+    "5": {
+      "task_name": "Water plant",
+      "total": 455,
+      "satay_correct": 116,
+      "yolo_correct": 114,
+      "satay_acc": 0.2549450549450549,
+      "yolo_acc": 0.25054945054945055
+    },
+    "6": {
+      "task_name": "Get lemon out of tea",
+      "total": 438,
+      "satay_correct": 66,
+      "yolo_correct": 43,
+      "satay_acc": 0.1506849315068493,
+      "yolo_acc": 0.09817351598173515
+    },
+    "7": {
+      "task_name": "Dig hole",
+      "total": 640,
+      "satay_correct": 104,
+      "yolo_correct": 48,
+      "satay_acc": 0.1625,
+      "yolo_acc": 0.075
+    },
+    "8": {
+      "task_name": "Open bottle of beer",
+      "total": 153,
+      "satay_correct": 27,
+      "yolo_correct": 29,
+      "satay_acc": 0.17647058823529413,
+      "yolo_acc": 0.1895424836601307
+    },
+    "9": {
+      "task_name": "Open parcel",
+      "total": 207,
+      "satay_correct": 32,
+      "yolo_correct": 18,
+      "satay_acc": 0.15458937198067632,
+      "yolo_acc": 0.08695652173913043
+    },
+    "10": {
+      "task_name": "Serve wine",
+      "total": 316,
+      "satay_correct": 68,
+      "yolo_correct": 79,
+      "satay_acc": 0.21518987341772153,
+      "yolo_acc": 0.25
+    },
+    "11": {
+      "task_name": "Pour sugar",
+      "total": 550,
+      "satay_correct": 111,
+      "yolo_correct": 76,
+      "satay_acc": 0.2018181818181818,
+      "yolo_acc": 0.13818181818181818
+    },
+    "12": {
+      "task_name": "Smear butter",
+      "total": 248,
+      "satay_correct": 28,
+      "yolo_correct": 21,
+      "satay_acc": 0.11290322580645161,
+      "yolo_acc": 0.0846774193548387
+    },
+    "13": {
+      "task_name": "Extinguish fire",
+      "total": 260,
+      "satay_correct": 57,
+      "yolo_correct": 57,
+      "satay_acc": 0.21923076923076923,
+      "yolo_acc": 0.21923076923076923
+    },
+    "14": {
+      "task_name": "Pound carpet",
+      "total": 710,
+      "satay_correct": 128,
+      "yolo_correct": 66,
+      "satay_acc": 0.18028169014084508,
+      "yolo_acc": 0.09295774647887324
+    }
+  }
+}

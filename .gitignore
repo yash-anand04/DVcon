@@ -1,4 +1,30 @@
-#folders
-Data/*
-venv/*
-.vscode/*
+# Data
+Data/
+Data_Preprocessed/
+runs/
+
+# Virtual Environments
+venv/
+env/
+.env/
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# Weights & Models
+*.pt
+*.pth
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# OS specific
+.DS_Store
+Thumbs.db
+/Scripts
