@@ -21,10 +21,14 @@ Gradients flow all the way back through the backbone, so the feature
 extractor learns which spatial patterns matter for each task.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics import YOLO
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_YOLO_PATH = os.path.join(CURRENT_DIR, "weights_e2e", "yolo11n.pt")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -49,8 +53,9 @@ class YOLOBackbone(nn.Module):
     """
     HOOK_LAYERS = {4: "p3", 6: "p4", 8: "p5"}   # layer index -> name
 
-    def __init__(self, checkpoint="yolo11n.pt"):
+    def __init__(self, checkpoint=DEFAULT_YOLO_PATH):
         super().__init__()
+        os.makedirs(os.path.dirname(checkpoint), exist_ok=True)
         yolo = YOLO(checkpoint)
         full_model = yolo.model.model           # nn.Sequential of 24 modules
         # Keep only the backbone (up to + including layer 8 / SPPF = layer 9
@@ -167,7 +172,7 @@ class SATAYViT_E2E(nn.Module):
     Input : image (B,3,640,640)  +  task_id (B,)
     Output: relevance heatmap (B,16,16)
     """
-    def __init__(self, yolo_checkpoint="yolo11n.pt", embed_dim=256, num_tasks=14):
+    def __init__(self, yolo_checkpoint=DEFAULT_YOLO_PATH, embed_dim=256, num_tasks=14):
         super().__init__()
         self.backbone   = YOLOBackbone(yolo_checkpoint)
         self.aggregator = FPNAggregator(self.backbone.out_channels, embed_dim)

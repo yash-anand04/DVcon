@@ -1,121 +1,121 @@
 {
   "total_samples": 6173,
-  "top1_satay": 0.49975700631783576,
+  "top1_satay": 0.19277498785031588,
   "top1_yolo": 0.1558399481613478,
-  "delta": 0.343917058156488,
-  "map50": 0.7579736026246711,
-  "precision": 0.49975700631783576,
+  "delta": 0.03693503968896808,
+  "map50": 0.23555628126057607,
+  "precision": 0.19277498785031588,
   "per_task": {
     "1": {
       "task_name": "Step on something",
       "total": 486,
-      "satay_correct": 237,
+      "satay_correct": 99,
       "yolo_correct": 81,
-      "satay_acc": 0.4876543209876543,
+      "satay_acc": 0.2037037037037037,
       "yolo_acc": 0.16666666666666666
     },
     "2": {
       "task_name": "Sit comfortably",
       "total": 660,
-      "satay_correct": 331,
+      "satay_correct": 189,
       "yolo_correct": 155,
-      "satay_acc": 0.5015151515151515,
+      "satay_acc": 0.2863636363636364,
       "yolo_acc": 0.23484848484848486
     },
     "3": {
       "task_name": "Place flowers",
       "total": 411,
-      "satay_correct": 242,
+      "satay_correct": 92,
       "yolo_correct": 102,
-      "satay_acc": 0.5888077858880778,
+      "satay_acc": 0.22384428223844283,
       "yolo_acc": 0.24817518248175183
     },
     "4": {
       "task_name": "Get potatoes out of fire",
       "total": 639,
-      "satay_correct": 324,
+      "satay_correct": 103,
       "yolo_correct": 73,
-      "satay_acc": 0.5070422535211268,
+      "satay_acc": 0.16118935837245696,
       "yolo_acc": 0.11424100156494522
     },
     "5": {
       "task_name": "Water plant",
       "total": 455,
-      "satay_correct": 254,
+      "satay_correct": 109,
       "yolo_correct": 114,
-      "satay_acc": 0.5582417582417583,
+      "satay_acc": 0.23956043956043957,
       "yolo_acc": 0.25054945054945055
     },
     "6": {
       "task_name": "Get lemon out of tea",
       "total": 438,
-      "satay_correct": 155,
+      "satay_correct": 62,
       "yolo_correct": 43,
-      "satay_acc": 0.3538812785388128,
+      "satay_acc": 0.1415525114155251,
       "yolo_acc": 0.09817351598173515
     },
     "7": {
       "task_name": "Dig hole",
       "total": 640,
-      "satay_correct": 360,
+      "satay_correct": 118,
       "yolo_correct": 48,
-      "satay_acc": 0.5625,
+      "satay_acc": 0.184375,
       "yolo_acc": 0.075
     },
     "8": {
       "task_name": "Open bottle of beer",
       "total": 153,
-      "satay_correct": 51,
+      "satay_correct": 22,
       "yolo_correct": 29,
-      "satay_acc": 0.3333333333333333,
+      "satay_acc": 0.1437908496732026,
       "yolo_acc": 0.1895424836601307
     },
     "9": {
       "task_name": "Open parcel",
       "total": 207,
-      "satay_correct": 75,
+      "satay_correct": 31,
       "yolo_correct": 18,
-      "satay_acc": 0.36231884057971014,
+      "satay_acc": 0.1497584541062802,
       "yolo_acc": 0.08695652173913043
     },
     "10": {
       "task_name": "Serve wine",
       "total": 316,
-      "satay_correct": 201,
+      "satay_correct": 62,
       "yolo_correct": 79,
-      "satay_acc": 0.6360759493670886,
+      "satay_acc": 0.1962025316455696,
       "yolo_acc": 0.25
     },
     "11": {
       "task_name": "Pour sugar",
       "total": 550,
-      "satay_correct": 240,
+      "satay_correct": 110,
       "yolo_correct": 76,
-      "satay_acc": 0.43636363636363634,
+      "satay_acc": 0.2,
       "yolo_acc": 0.13818181818181818
     },
     "12": {
       "task_name": "Smear butter",
       "total": 248,
-      "satay_correct": 86,
+      "satay_correct": 28,
       "yolo_correct": 21,
-      "satay_acc": 0.3467741935483871,
+      "satay_acc": 0.11290322580645161,
       "yolo_acc": 0.0846774193548387
     },
     "13": {
       "task_name": "Extinguish fire",
       "total": 260,
-      "satay_correct": 126,
+      "satay_correct": 49,
       "yolo_correct": 57,
-      "satay_acc": 0.4846153846153846,
+      "satay_acc": 0.18846153846153846,
       "yolo_acc": 0.21923076923076923
     },
     "14": {
       "task_name": "Pound carpet",
       "total": 710,
-      "satay_correct": 403,
+      "satay_correct": 116,
       "yolo_correct": 66,
-      "satay_acc": 0.5676056338028169,
+      "satay_acc": 0.16338028169014085,
       "yolo_acc": 0.09295774647887324
     }
   }

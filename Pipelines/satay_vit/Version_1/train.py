@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_loader import COCOTasksDataset, custom_collate
+from utils.data_loader import COCOTasksDataset, custom_collate
 from model import MEViTReasoner
 
 def train_satay_vit(data_root="e:/DVcon/DVcon/Data_Preprocessed", epochs=10, batch_size=16, lr=1e-4, device="cuda" if torch.cuda.is_available() else "cpu"):

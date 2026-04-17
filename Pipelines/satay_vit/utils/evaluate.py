@@ -9,9 +9,10 @@ import matplotlib.pyplot as plt
 
 # Add parent directory to path to import models easily
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from model import MEViTReasoner
-from inference import fuse_yolo_and_vit
-from data_loader import COCOTasksDataset, custom_collate
+from Version_1.model import MEViTReasoner
+from Version_2.model_e2e import SATAYViT_E2E
+from utils.inference import fuse_yolo_and_vit
+from utils.data_loader import COCOTasksDataset, custom_collate
 from torch.utils.data import DataLoader
 
 # Task names from COCO-Tasks paper
@@ -53,7 +54,8 @@ def evaluate_best_model(
     data_root,
     weights_path,
     output_dir=None,
-    device="cuda" if torch.cuda.is_available() else "cpu"
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    use_original_data=False
 ):
     """
     Full SATAY-ViT evaluation:
@@ -73,78 +75,154 @@ def evaluate_best_model(
 
     # ------------------------------------------------------------------ models
     print("Loading Models...")
-    yolo_model = YOLO("yolo11n.pt").to(device)
+    yolo_weights_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights", "yolo11n.pt")
+    yolo_model = YOLO(yolo_weights_path).to(device)
     
     # Auto-detect architecture based on filename or checkpoint content
     if "e2e" in weights_path.lower():
-        from model_e2e import SATAYViT_E2E
         vit_model = SATAYViT_E2E(embed_dim=256).to(device)
         checkpoint = torch.load(weights_path, map_location=device)
         vit_model.load_state_dict(checkpoint["state_dict"])
     else:
         vit_model  = MEViTReasoner().to(device)
-        vit_model.load_state_dict(torch.load(weights_path, map_location=device))
+        checkpoint = torch.load(weights_path, map_location=device)
+        if "state_dict" in checkpoint:
+            vit_model.load_state_dict(checkpoint["state_dict"])
+        else:
+            vit_model.load_state_dict(checkpoint)
         
     vit_model.eval()
 
     # ------------------------------------------------------------------ loader
-    print("Loading Test Dataset...")
-    val_dataset = COCOTasksDataset(data_root, split="test")
-    val_loader  = DataLoader(val_dataset, batch_size=1, shuffle=False,
-                             num_workers=2, collate_fn=custom_collate)
-
-    # ------------------------------------------------------------------ accumulators
-    # Per-sample: (score, is_tp_satay, is_tp_yolo, task_id)
     records = []
-
     per_task_satay  = {t: {"correct": 0, "total": 0} for t in range(1, 15)}
     per_task_yolo   = {t: {"correct": 0, "total": 0} for t in range(1, 15)}
 
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Evaluating"):
-            img        = batch["image"].to(device)
-            task_id_t  = batch["task_id"].to(device)
-            task_id    = task_id_t.item()
-            prefs      = batch["prefs"][0]
-            gt_boxes   = batch["boxes"][0]
-            image_path = batch["image_paths"][0]
+    if use_original_data:
+        import cv2
+        from utils.preprocess_dataset import get_base_samples, letterbox_image_and_boxes
+        print("Loading Original Test Dataset...")
+        samples = get_base_samples(data_root, split="test")
 
-            preferred_gt = gt_boxes[prefs == 1]
-            if len(preferred_gt) == 0:
-                continue
+        # Standard ViT Normalization
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
 
-            per_task_satay[task_id]["total"] += 1
-            per_task_yolo[task_id]["total"]  += 1
+        with torch.no_grad():
+            for sample in tqdm(samples, desc="Evaluating Original Data"):
+                task_id = sample["task_id"]
+                img_path = sample["image_path"]
 
-            # --- YOLO inference ---
-            yolo_res = yolo_model(image_path, verbose=False)[0]
-            if len(yolo_res.boxes) == 0:
-                records.append((0.0, False, False, task_id))
-                continue
+                raw_boxes = []
+                prefs = []
+                for ann in sample["annotations"]:
+                    raw_boxes.append(ann["bbox"])
+                    prefs.append(ann["category_id"])
 
-            y_boxes   = torch.tensor([xyxy_to_xywh(b) for b in yolo_res.boxes.xyxy.cpu()])
-            y_confs   = yolo_res.boxes.conf.cpu()
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
 
-            # YOLO-only: pick highest confidence box
-            yolo_best_box = y_boxes[torch.argmax(y_confs)]
-            yolo_hit = any(compute_iou(yolo_best_box, gt) > 0.5 for gt in preferred_gt)
+                img_lb, new_boxes = letterbox_image_and_boxes(img, raw_boxes, new_shape=(640,640))
+                preferred_gt = [b for b, p in zip(new_boxes, prefs) if p == 1]
+                if len(preferred_gt) == 0:
+                    continue
 
-            # --- ViT fusion ---
-            heatmap  = vit_model(img, task_id_t)[0].cpu()
-            best_idx, fused_scores = fuse_yolo_and_vit(y_boxes, y_confs, heatmap)
+                per_task_satay[task_id]["total"] += 1
+                per_task_yolo[task_id]["total"]  += 1
 
-            if best_idx is None:
-                records.append((0.0, False, yolo_hit, task_id))
-                continue
+                # YOLO inference
+                yolo_res = yolo_model(img_lb, verbose=False)[0]
+                if len(yolo_res.boxes) == 0:
+                    records.append((0.0, False, False, task_id))
+                    continue
 
-            satay_best_box = y_boxes[best_idx]
-            fused_conf     = fused_scores[best_idx].item()
-            satay_hit = any(compute_iou(satay_best_box, gt) > 0.5 for gt in preferred_gt)
+                if len(yolo_res.boxes.xyxy) > 0:
+                    y_boxes   = torch.tensor([xyxy_to_xywh(b) for b in yolo_res.boxes.xyxy.cpu()])
+                else: # fallback if empty
+                    records.append((0.0, False, False, task_id))
+                    continue
+                    
+                y_confs   = yolo_res.boxes.conf.cpu()
 
-            records.append((fused_conf, satay_hit, yolo_hit, task_id))
+                yolo_best_box = y_boxes[torch.argmax(y_confs)]
+                yolo_hit = any(compute_iou(yolo_best_box, gt) > 0.5 for gt in preferred_gt)
 
-            if satay_hit: per_task_satay[task_id]["correct"] += 1
-            if yolo_hit:  per_task_yolo[task_id]["correct"]  += 1
+                # ViT fusion
+                img_rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
+                img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+                img_tensor = (img_tensor.to(device) - mean) / std
+                img_tensor = img_tensor.unsqueeze(0)
+
+                task_id_t = torch.tensor([task_id], dtype=torch.long, device=device)
+
+                heatmap  = vit_model(img_tensor, task_id_t)[0].cpu()
+                best_idx, fused_scores = fuse_yolo_and_vit(y_boxes, y_confs, heatmap)
+
+                if best_idx is None:
+                    records.append((0.0, False, yolo_hit, task_id))
+                    continue
+
+                satay_best_box = y_boxes[best_idx]
+                fused_conf     = fused_scores[best_idx].item()
+                satay_hit = any(compute_iou(satay_best_box, gt) > 0.5 for gt in preferred_gt)
+
+                records.append((fused_conf, satay_hit, yolo_hit, task_id))
+
+                if satay_hit: per_task_satay[task_id]["correct"] += 1
+                if yolo_hit:  per_task_yolo[task_id]["correct"]  += 1
+
+    else:
+        print("Loading Test Dataset...")
+        val_dataset = COCOTasksDataset(data_root, split="test")
+        val_loader  = DataLoader(val_dataset, batch_size=1, shuffle=False,
+                                 num_workers=3,pin_memory=True, collate_fn=custom_collate)
+
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating"):
+                img        = batch["image"].to(device)
+                task_id_t  = batch["task_id"].to(device)
+                task_id    = task_id_t.item()
+                prefs      = batch["prefs"][0]
+                gt_boxes   = batch["boxes"][0]
+                image_path = batch["image_paths"][0]
+
+                preferred_gt = gt_boxes[prefs == 1]
+                if len(preferred_gt) == 0:
+                    continue
+
+                per_task_satay[task_id]["total"] += 1
+                per_task_yolo[task_id]["total"]  += 1
+
+                # --- YOLO inference ---
+                yolo_res = yolo_model(image_path, verbose=False)[0]
+                if len(yolo_res.boxes) == 0:
+                    records.append((0.0, False, False, task_id))
+                    continue
+
+                y_boxes   = torch.tensor([xyxy_to_xywh(b) for b in yolo_res.boxes.xyxy.cpu()])
+                y_confs   = yolo_res.boxes.conf.cpu()
+
+                # YOLO-only: pick highest confidence box
+                yolo_best_box = y_boxes[torch.argmax(y_confs)]
+                yolo_hit = any(compute_iou(yolo_best_box, gt) > 0.5 for gt in preferred_gt)
+
+                # --- ViT fusion ---
+                heatmap  = vit_model(img, task_id_t)[0].cpu()
+                best_idx, fused_scores = fuse_yolo_and_vit(y_boxes, y_confs, heatmap)
+
+                if best_idx is None:
+                    records.append((0.0, False, yolo_hit, task_id))
+                    continue
+
+                satay_best_box = y_boxes[best_idx]
+                fused_conf     = fused_scores[best_idx].item()
+                satay_hit = any(compute_iou(satay_best_box, gt) > 0.5 for gt in preferred_gt)
+
+                records.append((fused_conf, satay_hit, yolo_hit, task_id))
+
+                if satay_hit: per_task_satay[task_id]["correct"] += 1
+                if yolo_hit:  per_task_yolo[task_id]["correct"]  += 1
 
     # ------------------------------------------------------------------ metrics
     total   = len(records)
@@ -258,7 +336,8 @@ def evaluate_best_model(
 
 if __name__ == "__main__":
     evaluate_best_model(
-        data_root    = "e:/DVcon/DVcon/Data_Preprocessed",
-        weights_path = "E:/DVcon/DVcon/Pipelines/satay_vit/weights_e2e/satay_vit_e2e_best.pt",
-        output_dir   = "e:/DVcon/DVcon/Pipelines/satay_vit/weights_e2e",
+        data_root    = "e:/DVcon/DVcon/Data",
+        weights_path = "E:/DVcon/DVcon/Pipelines/satay_vit/Version_2/weights_e2e/satay_vit_e2e_epoch_3.pt",
+        output_dir   = "e:/DVcon/DVcon/Pipelines/satay_vit/Version_2",
+        use_original_data = True
     )
