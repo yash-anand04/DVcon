@@ -74,7 +74,7 @@ def letterbox_image_and_boxes(img, boxes, new_shape=(640, 640)):
         
     return img, new_boxes
 
-def process_and_dump_dataset(data_root="e:/DVcon/DVcon/Data", output_root="e:/DVcon/DVcon/Data_Preprocessed", img_size=(640, 640), grid_size=(16, 16)):
+def process_and_dump_dataset(data_root="e:/DVcon/DVcon/Data", output_root="e:/DVcon/DVcon/Data_Preprocessed_32", img_size=(640, 640), grid_size=(32, 32)):
     print(f"Beginning massive offline preprocessing to {output_root}")
     os.makedirs(output_root, exist_ok=True)
     

@@ -1,50 +1,55 @@
 import torch
 
-def fuse_yolo_and_vit(yolo_boxes, yolo_confs, vit_heatmap, img_size=(640, 640)):
+def fuse_yolo_and_vit(yolo_boxes, yolo_confs, vit_heatmap, img_size=(640, 640),
+                      relevance_floor=0.0):
     """
     Fuses the outputs of the YOLO localizer and ViT reasoner.
     yolo_boxes: Tensor (N, 4) in [x_min, y_min, w, h] format relative to 640x640
     yolo_confs: Tensor (N,) of YOLO objectness/class confidence
     vit_heatmap: Tensor (16, 16) with values in [0, 1] representing task relevance
-    
+    relevance_floor: float, minimum relevance score before multiplication.
+        Set to 0.3 for V5+ to prevent bad reasoning from overriding strong detections.
+        Formula: S_i = conf_i * max(heatmap_score_i, relevance_floor)
+
     Returns:
         best_box_idx: standard integer index of the most appropriate box
         fused_scores: Tensor (N,)
     """
     if len(yolo_boxes) == 0:
         return None, []
-        
+
     grid_h, grid_w = vit_heatmap.shape
     patch_w = img_size[0] / grid_w
     patch_h = img_size[1] / grid_h
-    
+
     fused_scores = []
-    
+
     for i, box in enumerate(yolo_boxes):
         x, y, w, h = box
-        
-        # Calculate center of the bounding box
+
         cx = x + w / 2.0
         cy = y + h / 2.0
-        
-        # Map to heatmap grid indices
+
         grid_x = int(cx / patch_w)
         grid_y = int(cy / patch_h)
-        
-        # Clamp to grid boundaries just in case
+
         grid_x = max(0, min(grid_w - 1, grid_x))
         grid_y = max(0, min(grid_h - 1, grid_y))
-        
+
         relevance_score = vit_heatmap[grid_y, grid_x]
-        
-        # Semantic Fusion
+
+        # Apply relevance floor: prevents near-zero heatmap from killing confident detections
+        if relevance_floor > 0.0:
+            relevance_score = max(relevance_score, relevance_floor)
+
         fused = yolo_confs[i] * relevance_score
         fused_scores.append(fused)
-        
+
     fused_scores = torch.tensor(fused_scores)
     best_box_idx = torch.argmax(fused_scores).item()
-    
+
     return best_box_idx, fused_scores
+
 
 def draw_inference(img, yolo_boxes, yolo_confs, fused_scores, best_idx, task_name="Task"):
     """ Utility to visualize the result. Not strictly needed for FPGA, but good for PyTorch eval. """

@@ -2,10 +2,12 @@ import os
 import json
 import cv2
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 class COCOTasksDataset(Dataset):
-    def __init__(self, data_root, split='train'):
+    def __init__(self, data_root, split='train', grid_size=16):
+        self.grid_size = grid_size
         """
         data_root: e.g. "e:/DVcon/DVcon/Data_Preprocessed"
         split: "train" or "test"
@@ -19,7 +21,7 @@ class COCOTasksDataset(Dataset):
         with open(index_path, "r") as f:
             self.samples = json.load(f)
             
-        print(f"Loaded {len(self.samples)} PREPROCESSED samples for {split} split.")
+        print(f"Loaded {len(self.samples)} PREPROCESSED samples for {split} split. Target grid: {self.grid_size}x{self.grid_size}")
         
     def __len__(self):
         return len(self.samples)
@@ -44,6 +46,21 @@ class COCOTasksDataset(Dataset):
 
         # Load pre-computed heatmap effortlessly
         heatmap_tensor = torch.load(sample["heatmap_path"], weights_only=True)
+        
+        # --- NEW LOGIC: Dynamic Resizing ---
+        # If the loaded heatmap is 16x16 but we requested 32x32, interpolate it seamlessly.
+        if heatmap_tensor.shape != (self.grid_size, self.grid_size):
+            # F.interpolate expects (Batch, Channel, Height, Width), so we add and remove dummy dimensions
+            heatmap_tensor = heatmap_tensor.unsqueeze(0).unsqueeze(0) 
+            heatmap_tensor = F.interpolate(
+                heatmap_tensor, 
+                size=(self.grid_size, self.grid_size), 
+                mode='bilinear', 
+                align_corners=False
+            )
+            heatmap_tensor = heatmap_tensor.squeeze(0).squeeze(0)
+        # -----------------------------------
+
         task_tensor = torch.tensor(sample["task_id"], dtype=torch.long)
         
         boxes = sample["boxes"]

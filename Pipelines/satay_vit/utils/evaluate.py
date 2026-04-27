@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 # Add parent directory to path to import models easily
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from Version_1.model import MEViTReasoner
-from Version_2.model_e2e import SATAYViT_E2E
 from utils.inference import fuse_yolo_and_vit
 from utils.data_loader import COCOTasksDataset, custom_collate
 from torch.utils.data import DataLoader
@@ -80,6 +79,10 @@ def evaluate_best_model(
     
     # Auto-detect architecture based on filename or checkpoint content
     if "e2e" in weights_path.lower():
+        if "Version_3" in weights_path:
+            from Version_3.model_e2e import SATAYViT_E2E
+        else:
+            from Version_2.model_e2e import SATAYViT_E2E
         vit_model = SATAYViT_E2E(embed_dim=256).to(device)
         checkpoint = torch.load(weights_path, map_location=device)
         vit_model.load_state_dict(checkpoint["state_dict"])
@@ -174,7 +177,10 @@ def evaluate_best_model(
 
     else:
         print("Loading Test Dataset...")
-        val_dataset = COCOTasksDataset(data_root, split="test")
+        if "Version_3" in weights_path:
+            val_dataset = COCOTasksDataset(data_root, split="test", grid_size=32)
+        else:
+            val_dataset = COCOTasksDataset(data_root, split="test", grid_size=16)
         val_loader  = DataLoader(val_dataset, batch_size=1, shuffle=False,
                                  num_workers=3,pin_memory=True, collate_fn=custom_collate)
 
@@ -336,8 +342,8 @@ def evaluate_best_model(
 
 if __name__ == "__main__":
     evaluate_best_model(
-        data_root    = "e:/DVcon/DVcon/Data",
-        weights_path = "E:/DVcon/DVcon/Pipelines/satay_vit/Version_2/weights_e2e/satay_vit_e2e_epoch_3.pt",
-        output_dir   = "e:/DVcon/DVcon/Pipelines/satay_vit/Version_2",
-        use_original_data = True
+        data_root    = "e:/DVcon/DVcon/Data_Preprocessed_32",
+        weights_path = "E:/DVcon/DVcon/Pipelines/satay_vit/Version_3/weights/satay_vit_e2e_best.pt",
+        output_dir   = "e:/DVcon/DVcon/Pipelines/satay_vit/Version_3",
+        use_original_data = False
     )
