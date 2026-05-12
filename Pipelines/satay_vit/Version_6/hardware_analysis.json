@@ -1,0 +1,35 @@
+{
+  "params": {
+    "backbone": 951136,
+    "roi_fusion": 415488,
+    "scorer": 1189889,
+    "total": 2556513
+  },
+  "weight_memory_bytes": {
+    "fp32": 10226052,
+    "int8": 2556513
+  },
+  "activation_memory_fp32_bytes": {
+    "fpn_maps": 4505600,
+    "roi_tokens": 30720,
+    "scorer": 10240,
+    "peak": 4546560
+  },
+  "macs": {
+    "fpn_backbone": 3126067200,
+    "fpn_projections": 288358400,
+    "roi_align": 1505280,
+    "fuse_and_class": 2826240,
+    "scorer": 5350400,
+    "total": 3424107520
+  },
+  "bram": {
+    "peak_layer_ping_pong_bytes": 1179648,
+    "activation_buffer_bytes": 819200,
+    "total_estimated_bytes": 1998848,
+    "available_bytes": 2097152,
+    "utilisation_pct": 95.31
+  },
+  "fpga_feasible": true,
+  "n_detections_assumed": 10
+}
