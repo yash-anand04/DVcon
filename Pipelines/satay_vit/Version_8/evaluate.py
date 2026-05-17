@@ -1,5 +1,5 @@
 """
-evaluate.py  –  SATAY-ViT V6 Evaluation
+evaluate.py  –  SATAY-ViT V8 Evaluation
 ========================================
 Computes Top-1 Accuracy and mAP@0.5 on the COCO-Tasks test split,
 matching the V1B evaluation style: per-task plots, multiple IoU
@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from model import DEFAULT_YOLO_PATH, SATAYViT_V6, YOLODetector
+from model import DEFAULT_YOLO_PATH, SATAYViT_V8, YOLODetector
 from utils.data_loader import COCOTasksDataset, custom_collate
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +40,7 @@ TASK_NAMES = {
 
 DEFAULTS = dict(
     data_root      = "e:/DVcon/DVcon/Data_Preprocessed",
-    weights        = os.path.join(CURRENT_DIR, "weights", "v6_best.pt"),
+    weights        = os.path.join(CURRENT_DIR, "weights", "v8_best.pt"),
     yolo_model     = DEFAULT_YOLO_PATH,
     output_dir     = CURRENT_DIR,
     batch          = 8,
@@ -99,14 +99,14 @@ def evaluate(cfg):
     )
 
     detector = YOLODetector(checkpoint=cfg["yolo_model"], device=device)
-    model    = SATAYViT_V6(checkpoint=cfg["yolo_model"]).to(device)
+    model    = SATAYViT_V8(checkpoint=cfg["yolo_model"]).to(device)
 
     if os.path.exists(cfg["weights"]):
         ckpt = torch.load(cfg["weights"], map_location=device)
         model.load_state_dict(ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt)
         print(f"Loaded weights: {cfg['weights']}")
     else:
-        raise FileNotFoundError(f"V6 weights not found: {cfg['weights']}")
+        raise FileNotFoundError(f"V8 weights not found: {cfg['weights']}")
     model.eval()
 
     iou_thresholds = cfg["iou_thresholds"]
@@ -114,11 +114,11 @@ def evaluate(cfg):
         iou_thresholds = [iou_thresholds]
 
     records         = []
-    per_task_v6     = {t: {"total": 0, "correct": {iou: 0 for iou in iou_thresholds}} for t in range(1, 15)}
+    per_task_v7     = {t: {"total": 0, "correct": {iou: 0 for iou in iou_thresholds}} for t in range(1, 15)}
     per_task_yolo   = {t: {"total": 0, "correct": {iou: 0 for iou in iou_thresholds}} for t in range(1, 15)}
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Evaluating V6"):
+        for batch in tqdm(loader, desc="Evaluating V8"):
             pil_images  = load_pil_images(batch["image_paths"])
             img_tensors = batch["image"].to(device)
             task_ids    = batch["task_id"].to(device)
@@ -143,7 +143,7 @@ def evaluate(cfg):
                     records.append((0.0, hit_dict, yolo_hit_dict, task_id))
                     continue
 
-                per_task_v6[task_id]["total"]   += 1
+                per_task_v7[task_id]["total"]   += 1
                 per_task_yolo[task_id]["total"] += 1
 
                 n_b   = boxes_b.shape[0]
@@ -154,36 +154,36 @@ def evaluate(cfg):
                 yolo_scores  = det_scores_t[b, :n_b].clone()
                 yolo_scores[~valid] = -1.0
 
-                best_v6   = int(final_scores.argmax())
+                best_v7   = int(final_scores.argmax())
                 best_yolo = int(yolo_scores.argmax())
 
-                v6_box   = boxes_b[best_v6].unsqueeze(0)
+                v8_box   = boxes_b[best_v7].unsqueeze(0)
                 yolo_box = boxes_b[best_yolo].unsqueeze(0)
 
-                v6_iou   = pairwise_iou_xyxy(v6_box,   preferred_xyxy).max().item()
+                v8_iou   = pairwise_iou_xyxy(v8_box,   preferred_xyxy).max().item()
                 yolo_iou = pairwise_iou_xyxy(yolo_box, preferred_xyxy).max().item()
 
-                hit_dict      = {iou: v6_iou   >= iou for iou in iou_thresholds}
+                hit_dict      = {iou: v8_iou   >= iou for iou in iou_thresholds}
                 yolo_hit_dict = {iou: yolo_iou >= iou for iou in iou_thresholds}
 
-                records.append((float(final_scores[best_v6].item()), hit_dict, yolo_hit_dict, task_id))
+                records.append((float(final_scores[best_v7].item()), hit_dict, yolo_hit_dict, task_id))
 
                 for iou in iou_thresholds:
                     if hit_dict[iou]:
-                        per_task_v6[task_id]["correct"][iou]   += 1
+                        per_task_v7[task_id]["correct"][iou]   += 1
                     if yolo_hit_dict[iou]:
                         per_task_yolo[task_id]["correct"][iou] += 1
 
     # ── Aggregate metrics ──────────────────────────────────────────────
     total     = len(records)
-    top1_v6   = {}
+    top1_v7   = {}
     top1_yolo = {}
     maps      = {}
 
     for iou in iou_thresholds:
         tp_v6   = sum(r[1][iou] for r in records)
         tp_yolo = sum(r[2][iou] for r in records)
-        top1_v6[iou]   = tp_v6   / total if total else 0.0
+        top1_v7[iou]   = tp_v6   / total if total else 0.0
         top1_yolo[iou] = tp_yolo / total if total else 0.0
 
         sorted_recs = sorted(records, key=lambda r: r[0], reverse=True)
@@ -198,31 +198,31 @@ def evaluate(cfg):
 
     per_task_results = {}
     for t in range(1, 15):
-        n = per_task_v6[t]["total"]
+        n = per_task_v7[t]["total"]
         per_task_results[t] = {
             "task_name": TASK_NAMES[t],
             "total":     n,
-            "v6_acc":    {iou: per_task_v6[t]["correct"][iou]   / n if n else 0.0 for iou in iou_thresholds},
+            "v8_acc":    {iou: per_task_v7[t]["correct"][iou]   / n if n else 0.0 for iou in iou_thresholds},
             "yolo_acc":  {iou: per_task_yolo[t]["correct"][iou] / n if n else 0.0 for iou in iou_thresholds},
         }
 
     # ── Print table ────────────────────────────────────────────────────
     primary = iou_thresholds[0]
     print("\n" + "=" * 70)
-    print("  SATAY-ViT V6 EVALUATION RESULTS")
+    print("  SATAY-ViT V8 EVALUATION RESULTS")
     print("=" * 70)
     print(f"  Total samples evaluated : {total:,}")
     for iou in iou_thresholds:
-        print(f"  Top-1 V6   @ IoU {iou:.2f}  : {top1_v6[iou]*100:.2f}%")
+        print(f"  Top-1 V8   @ IoU {iou:.2f}  : {top1_v7[iou]*100:.2f}%")
     print(f"  Top-1 YOLO @ IoU {primary:.2f}  : {top1_yolo[primary]*100:.2f}%")
     for iou in iou_thresholds:
         print(f"  mAP @ IoU  {iou:.2f}        : {maps[iou]*100:.2f}%")
     print("-" * 70)
-    print(f"  {'Task':<30} {'V6':>8}   {'YOLO':>8}")
+    print(f"  {'Task':<30} {'V8':>8}   {'YOLO':>8}")
     print("-" * 70)
     for t in range(1, 15):
         n  = per_task_results[t]["total"]
-        v6 = per_task_results[t]["v6_acc"][primary] * 100
+        v6 = per_task_results[t]["v8_acc"][primary] * 100
         yo = per_task_results[t]["yolo_acc"][primary] * 100
         print(f"  {TASK_NAMES[t]:<30} {v6:>7.1f}%  {yo:>7.1f}%")
     print("=" * 70)
@@ -230,7 +230,7 @@ def evaluate(cfg):
     # ── Save JSON ──────────────────────────────────────────────────────
     results = {
         "total_samples": total,
-        "top1_v6":       top1_v6,
+        "top1_v7":       top1_v7,
         "top1_yolo":     top1_yolo,
         "map":           maps,
         "per_task":      per_task_results,
@@ -244,13 +244,13 @@ def evaluate(cfg):
     labels   = [TASK_NAMES[t] for t in range(1, 15)]
     x        = np.arange(len(labels))
     width    = 0.38
-    v6_accs  = [per_task_results[t]["v6_acc"][primary]   * 100 for t in range(1, 15)]
+    v8_accs  = [per_task_results[t]["v8_acc"][primary]   * 100 for t in range(1, 15)]
     yo_accs  = [per_task_results[t]["yolo_acc"][primary] * 100 for t in range(1, 15)]
-    ax.bar(x - width / 2, v6_accs, width, label="V6 RoI-Align", color="#C84B0E", zorder=3)
+    ax.bar(x - width / 2, v8_accs, width, label="V8 RoI-Align", color="#C84B0E", zorder=3)
     ax.bar(x + width / 2, yo_accs, width, label="YOLO-only",     color="#88BBE8", zorder=3)
     ax.set_xlabel("Task")
     ax.set_ylabel("Top-1 Accuracy (%)")
-    ax.set_title("SATAY-ViT V6 vs YOLO-only — Per-Task Accuracy")
+    ax.set_title("SATAY-ViT V8 vs YOLO-only — Per-Task Accuracy")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=9)
     ax.set_ylim(0, 100)
@@ -259,7 +259,7 @@ def evaluate(cfg):
     ax.legend(fontsize=11)
     fig.text(
         0.5, 0.97,
-        f"Overall: V6 {top1_v6[primary]*100:.1f}%  |  YOLO {top1_yolo[primary]*100:.1f}%  |  mAP@{primary} {maps[primary]*100:.1f}%",
+        f"Overall: V8 {top1_v7[primary]*100:.1f}%  |  YOLO {top1_yolo[primary]*100:.1f}%  |  mAP@{primary} {maps[primary]*100:.1f}%",
         ha="center", va="top", fontsize=10, color="#444444",
     )
     plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -287,7 +287,7 @@ def evaluate(cfg):
             else:
                 ax.set_xlabel("Epoch")
             ax.set_ylabel("BCE Loss")
-            ax.set_title("V6 Training / Validation Loss")
+            ax.set_title("V8 Training / Validation Loss")
             ax.legend()
             ax.yaxis.grid(True, linestyle="--", alpha=0.6)
             plt.tight_layout()

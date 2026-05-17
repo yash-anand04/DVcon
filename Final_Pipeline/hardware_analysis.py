@@ -1,7 +1,7 @@
 """
-hardware_analysis.py  –  V6 FPGA Resource Estimator
-=====================================================
-Profiles SATAYViT_V6 for:
+hardware_analysis.py  –  TORCA FPGA Resource Estimator
+=======================================================
+Profiles TORCA for:
   - Parameter count per module
   - Weight memory footprint (FP32 / INT8)
   - Activation memory high-water mark
@@ -20,8 +20,10 @@ import math
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from model import SATAYViT_V6, DEFAULT_YOLO_PATH
+THIS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, THIS)
+
+from model import TORCA, DEFAULT_YOLO_PATH
 
 KINTEX7_BRAM_BYTES = 2 * 1024 * 1024       # 2 MB on Genesys 2
 BYTES_FP32         = 4
@@ -73,11 +75,8 @@ def macs_attention(seq_len, embed_dim, heads, batch=1):
     """Self-attention MACs: QKV proj + attn scores + weighted sum."""
     d = embed_dim
     n = seq_len
-    # QKV projections
-    qkv = 3 * macs_linear(d, d, batch * n)
-    # attention: Q × Kᵀ (n×d)×(d×n) + softmax-weighted sum
+    qkv  = 3 * macs_linear(d, d, batch * n)
     attn = batch * (n * n * d + n * n * d)
-    # output proj
     out  = macs_linear(d, d, batch * n)
     return qkv + attn + out
 
@@ -89,29 +88,38 @@ def analyse(n_detections=10):
     """
     n_detections : typical number of YOLO boxes per image (10-20 is realistic).
     """
-    model = SATAYViT_V6(checkpoint=DEFAULT_YOLO_PATH)
+    model = TORCA(checkpoint=DEFAULT_YOLO_PATH)
     model.eval()
 
     bb  = model.backbone
     roi = model.roi_fusion
     sc  = model.scorer
 
+    # Frozen YOLO neck + detection head (layers 9+), run in parallel for detection.
+    _yolo = model._shared_yolo
+    yolo_all_layers = list(_yolo.model.model.children())
+    frozen_neck_head = nn.Sequential(*yolo_all_layers[9:])
+
     # ── Parameter breakdown ────────────────────────────────────────────
-    params_backbone = total_params(bb)
-    params_roi      = total_params(roi)
-    params_scorer   = total_params(sc)
-    params_total    = params_backbone + params_roi + params_scorer
+    params_backbone       = total_params(bb)
+    params_roi            = total_params(roi)
+    params_scorer         = total_params(sc)
+    params_trainable      = params_backbone + params_roi + params_scorer
+    params_frozen_det     = total_params(frozen_neck_head)   # YOLO neck + head (layers 9+)
+    params_total_system   = params_trainable + params_frozen_det
 
     # ── Weight memory ──────────────────────────────────────────────────
     w_fp32_bb  = param_bytes(bb,  BYTES_FP32)
     w_fp32_roi = param_bytes(roi, BYTES_FP32)
     w_fp32_sc  = param_bytes(sc,  BYTES_FP32)
-    w_fp32     = w_fp32_bb + w_fp32_roi + w_fp32_sc
+    w_fp32_det = param_bytes(frozen_neck_head, BYTES_FP32)
+    w_fp32     = w_fp32_bb + w_fp32_roi + w_fp32_sc + w_fp32_det
 
     w_int8_bb  = param_bytes(bb,  BYTES_INT8)
     w_int8_roi = param_bytes(roi, BYTES_INT8)
     w_int8_sc  = param_bytes(sc,  BYTES_INT8)
-    w_int8     = w_int8_bb + w_int8_roi + w_int8_sc
+    w_int8_det = param_bytes(frozen_neck_head, BYTES_INT8)
+    w_int8     = w_int8_bb + w_int8_roi + w_int8_sc + w_int8_det
 
     # ── Activation memory (peak, FP32) ─────────────────────────────────
     # P3: 80×80×128, P4: 40×40×128, P5: 20×20×256
@@ -120,21 +128,19 @@ def analyse(n_detections=10):
     act_p5   = 20 * 20 * 256  * BYTES_FP32
     act_fpn  = act_p3 + act_p4 + act_p5          # keep all 3 for RoI-Align
 
-    # RoI-Align outputs (projected): N × E × 7 × 7 per scale, then GAP → N × E
     roi_size = 7
     E        = 256
     N        = n_detections
     act_roi  = N * E * 3 * BYTES_FP32            # 3 GAP'd scale features before fuse
 
-    # Scorer: object tokens [N, E]
     act_sc   = N * E * BYTES_FP32
 
     act_peak_fp32 = act_fpn + act_roi + act_sc
-    act_peak_int8 = act_peak_fp32 // 4           # rough INT8 estimate
+    act_peak_int8 = act_peak_fp32 // 4
 
     # ── MAC count per inference pass ───────────────────────────────────
-    # FPN backbone (very rough — YOLOv11n layers 0-8)
-    # Dominant layers: C3k2 at stride 32 (layer 8) with ~256 ch, 20×20 spatial
+    # FPN backbone (YOLOv11n layers 0-8)
+    # First conv is stride-2: input 640×640 → output 320×320
     macs_fpn_approx = (
         macs_conv(3,   16,  3, 320, 320) +   # stride-2 → output is 320×320
         macs_conv(16,  32,  3, 320, 320) +
@@ -146,42 +152,31 @@ def analyse(n_detections=10):
         macs_conv(256, 256, 3,  20,  20)
     )
 
-    # RoI-Align: for each of 3 scales, bilinear interpolation over 7×7 grid
-    # Each RoI-Align is ≈ N × Cout × 7 × 7 × 4 (bilinear uses 4 points)
     macs_roi_align = N * 3 * E * roi_size * roi_size * 4
-    # 1×1 conv projections
     macs_proj = (
-        macs_conv(128, E, 1, 80, 80) +      # proj_p3 over full map (once)
-        macs_conv(128, E, 1, 40, 40) +      # proj_p4
-        macs_conv(256, E, 1, 20, 20)        # proj_p5
+        macs_conv(128, E, 1, 80, 80) +
+        macs_conv(128, E, 1, 40, 40) +
+        macs_conv(256, E, 1, 20, 20)
     )
-    # fuse MLP: N × (E*4 → E)
     macs_fuse   = macs_linear(E * 4, E, N)
-    # class proj: N × (80 → E)
     macs_cls    = macs_linear(80, E, N)
 
-    # Scorer: 2× self-attn + 1× cross-attn
     macs_self   = 2 * macs_attention(N, E, heads=4, batch=1)
-    macs_cross  = N * E + N * E             # Q×Kᵀ + weighted sum (simplified)
+    macs_cross  = N * E + N * E
     macs_scorer = macs_self + macs_cross
 
     macs_total = (macs_fpn_approx + macs_proj + macs_roi_align +
                   macs_fuse + macs_cls + macs_scorer)
 
     # ── BRAM fit analysis ─────────────────────────────────────────────
-    # Layer-pipelined: only peak single-layer weights in BRAM at once.
-    # Biggest layer in V6 backbone: C3k2 at layer 8, ~256 ch
-    # Rough estimate: 256×256×3×3 (depthwise separate in C3k2) ≈ 0.25 M params
-    peak_layer_params  = 256 * 256 * 3 * 3           # very conservative upper bound
+    peak_layer_params  = 256 * 256 * 3 * 3
     peak_layer_bram    = peak_layer_params * BYTES_INT8
-    ping_pong_bram     = 2 * peak_layer_bram          # double-buffer
+    ping_pong_bram     = 2 * peak_layer_bram
 
-    # Activation buffer: only need to hold one FPN level at a time for RoI
-    # Worst case: P3 (80×80×128 INT8) = 819 KB
-    act_bram_p3_int8  = 80 * 80 * 128 * BYTES_INT8
+    act_bram_p3_int8   = 80 * 80 * 128 * BYTES_INT8
 
-    total_bram_needed = ping_pong_bram + act_bram_p3_int8
-    bram_util_pct     = total_bram_needed / KINTEX7_BRAM_BYTES * 100
+    total_bram_needed  = ping_pong_bram + act_bram_p3_int8
+    bram_util_pct      = total_bram_needed / KINTEX7_BRAM_BYTES * 100
 
     # ── Print report ──────────────────────────────────────────────────
     div = "─" * 68
@@ -193,12 +188,14 @@ def analyse(n_detections=10):
 
     print(f"\n{'PARAMETER BREAKDOWN':}")
     print(div)
-    print(f"  {'FPN Backbone (YOLO layers 0-8)':<38} {fmt_k(params_backbone):>10} params")
-    print(f"  {'RoI Fusion (projections + fuse MLP)':<38} {fmt_k(params_roi):>10} params")
-    print(f"  {'Task Object Scorer (attn + heads)':<38} {fmt_k(params_scorer):>10} params")
-    print(f"  {'TOTAL (trainable)':<38} {fmt_k(params_total):>10} params")
-    print(f"\n  V1B comparison: ~29 M params  (18× larger)")
-    print(f"  V3  comparison: ~2.2 M params  (1.4× larger)")
+    print(f"  {'FPN Backbone (YOLO layers 0-8, fine-tuned)':<42} {fmt_k(params_backbone):>10} params")
+    print(f"  {'RoI Fusion (projections + fuse MLP)':<42} {fmt_k(params_roi):>10} params")
+    print(f"  {'Task Object Scorer (attn + heads)':<42} {fmt_k(params_scorer):>10} params")
+    print(f"  {'Subtotal — trainable task modules':<42} {fmt_k(params_trainable):>10} params")
+    print(f"  {'Frozen detector (YOLO neck+head, layers 9+)':<42} {fmt_k(params_frozen_det):>10} params")
+    print(f"  {'TOTAL SYSTEM (unique weights)':<42} {fmt_k(params_total_system):>10} params")
+    print(f"\n  Backbone is SHARED between detector and FPN feature path.")
+    print(f"  Sawatzky et al. comparison: 25.5 M params  (~6× larger)")
 
     print(f"\n{'WEIGHT MEMORY':}")
     print(div)
@@ -207,6 +204,7 @@ def analyse(n_detections=10):
     print(f"    Backbone INT8 : {fmt(w_int8_bb)}")
     print(f"    RoI fusion    : {fmt(w_int8_roi)}")
     print(f"    Scorer        : {fmt(w_int8_sc)}")
+    print(f"    Frozen det.   : {fmt(w_int8_det)}  (DDR3-resident)")
 
     print(f"\n{'ACTIVATION MEMORY (FP32, peak per image)':<}")
     print(div)
@@ -249,23 +247,24 @@ def analyse(n_detections=10):
     print(f"\n{'SUMMARY vs ALTERNATIVES':}")
     print(div)
     rows = [
-        ("Model",    "Params",    "INT8 Wts", "BRAM est.", "FPGA?",  "Top-1"),
-        ("─"*10,     "─"*9,       "─"*9,      "─"*9,       "─"*6,    "─"*7),
-        ("V3",       "~2.2 M",    "~2.2 MB",  "~1.2 MB",  "Yes ✓",  "51.5%"),
-        ("TORCA (ours)","2.56 M",  f"{fmt(w_int8)}", f"{fmt(total_bram_needed)}", "Yes ✓", "60.1%"),
-        ("V1B",      "~29 M",     "~29 MB",   ">2 MB",    "No ✗",   "58.5%"),
+        ("Model",         "Params",    "INT8 Wts", "BRAM est.", "FPGA?",  "Top-1"),
+        ("─"*12,          "─"*9,       "─"*9,      "─"*9,       "─"*6,    "─"*7),
+        ("V3",            "~2.2 M",    "~2.2 MB",  "~1.2 MB",  "Yes ✓",  "51.5%"),
+        ("TORCA (ours)",  f"{fmt_k(params_total_system)}", f"{fmt(w_int8)}", f"{fmt(total_bram_needed)}", "Yes ✓", "60.1%"),
+        ("V1B",           "~29 M",     "~29 MB",   ">2 MB",    "No ✗",   "58.5%"),
     ]
     for r in rows:
         print(f"  {r[0]:<14} {r[1]:>9}  {r[2]:>9}  {r[3]:>9}  {r[4]:>7}  {r[5]:>7}")
     print(f"\n{'='*68}\n")
 
-    # Save JSON summary
     summary = {
         "params": {
             "backbone": params_backbone,
             "roi_fusion": params_roi,
             "scorer": params_scorer,
-            "total": params_total,
+            "trainable_total": params_trainable,
+            "frozen_detector_neck_head": params_frozen_det,
+            "total_system": params_total_system,
         },
         "weight_memory_bytes": {
             "fp32": w_fp32,
@@ -295,7 +294,7 @@ def analyse(n_detections=10):
         "fpga_feasible": total_bram_needed <= KINTEX7_BRAM_BYTES,
         "n_detections_assumed": n_detections,
     }
-    out = os.path.join(os.path.dirname(__file__), "hardware_analysis.json")
+    out = os.path.join(THIS, "hardware_analysis.json")
     with open(out, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"JSON saved -> {out}")

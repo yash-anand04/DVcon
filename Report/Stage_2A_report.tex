@@ -1,0 +1,204 @@
+% =====================================================================
+% DVCon India 2026 — Design Contest — Stage 2A Report
+% Team CHIPMunks  ·  Pipeline: TORCA
+% Two-page format: page 1 = approach, page 2 = results.
+% Compile: pdflatex Stage_2A_report.tex
+% =====================================================================
+\documentclass[10pt,a4paper,twocolumn]{article}
+
+\usepackage[margin=0.7in,columnsep=0.30in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{stfloats}
+\usepackage{float}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{titling}
+\usepackage[font=small,labelfont=bf,skip=3pt]{caption}
+\usepackage[hidelinks]{hyperref}
+\usepackage[utf8]{inputenc}
+
+% ---- Compact section headings ---------------------------------------
+\usepackage{titlesec}
+\titleformat{\section}{\normalfont\bfseries\large}{\thesection.}{0.4em}{}
+\titleformat{\subsection}{\normalfont\bfseries\normalsize}{\thesubsection.}{0.4em}{}
+\titlespacing*{\section}{0pt}{6pt}{2pt}
+\titlespacing*{\subsection}{0pt}{4pt}{2pt}
+
+% ---- Title block ----------------------------------------------------
+% **TORCA** (Task-conditioned Object Ranking via Cross-Attention)
+\setlength{\droptitle}{-3.5em}
+\title{\vspace{-1.2em}
+  \textbf{TORCA: Task-Aware Object Selection via RoI-Align on YOLO FPN Features}\\
+  \large DVCon India 2026 — Design Contest, Stage 2A Report}
+\author{Team CHIPMunks}
+\date{\vspace{-1em}}
+
+\setlength{\columnsep}{0.30in}
+\setlength{\parskip}{2pt}
+\setlength{\parindent}{0pt}
+
+\begin{document}
+\twocolumn[\maketitle\vspace{-2.0em}]
+
+% =====================================================================
+% PAGE 1 — APPROACH
+% =====================================================================
+\section{Problem and objective}
+The contest evaluates 14 natural-language object-selection queries on the
+COCO-Tasks benchmark~\cite{sawatzky2019}, such as ``which object best fits
+\emph{digging a hole}?''. For each (image, task) pair the model must return a
+\emph{single} bounding box that an end user would prefer for the task.
+Performance is measured by Top-1 accuracy at IoU $\geq$ 0.5 against the
+human-labelled preferred-object ground truth, and by per-task
+mAP@0.5 averaged across the 14 queries.
+
+\section{Pipeline overview}
+Our submission, \textbf{TORCA}, is a dual-branch system:
+\textbf{(i)} a frozen \textbf{YOLOv11n} object detector proposes candidate
+boxes for every COCO class present in the image, while
+\textbf{(ii)} a trainable \textbf{task-aware scorer} re-ranks those boxes
+conditioned on the task identifier. The final per-box score
+\(S_{\text{final}} = S_{\text{rel}} \cdot S_{\text{conf}}\) multiplies our
+relevance score by YOLO's detection confidence, and we emit
+\(\arg\max\, S_{\text{final}}\) as the answer.
+
+\begin{figure*}[b]
+  \centering
+  \includegraphics[width=0.6\textwidth]{architecture_v6.png}
+  \caption{End-to-end TORCA inference pipeline. YOLOv11n proposes candidate
+  boxes; the fine-tuned FPN backbone (layers 0--8, 951~K params) extracts
+  multi-scale features for RoI-Align; a cross-attention scorer (1.60~M params)
+  re-ranks all detections by task relevance.}
+
+  \label{fig:arch}
+\end{figure*}
+
+\section{Architecture details}
+\textbf{FPN backbone.} Layers 0--8 of the YOLOv11n backbone are fine-tuned
+and produce three feature maps: $P_3$ (stride 8, $80{\times}80{\times}128$),
+$P_4$ (stride 16, $40{\times}40{\times}128$), and $P_5$ (stride 32, $20{\times}20{\times}256$).
+A single 951~K-param backbone pass covers all $N$ detections simultaneously,
+with features reused across every detected box via RoI-Align.
+
+
+\textbf{Multi-scale RoI-Align.} For each YOLO box we apply
+\texttt{torchvision.ops.roi\_align} at the three FPN scales with a
+$7{\times}7$ grid, then global-average-pool and concatenate the three
+resulting 256-D vectors with an 80-D one-hot of the predicted COCO class
+(projected through a linear layer). The fused token is passed through
+\textit{Linear$\to$LayerNorm$\to$GELU} to a 256-D per-object embedding.
+
+\textbf{Task Object Scorer.} N object tokens are first contextualised by
+two layers of multi-head self-attention (dim 256, 4 heads, FFN, pre-LN), then
+a 1-token \emph{task embedding} cross-attends over them. A final
+\textit{Linear$\to$Sigmoid} produces a relevance score
+$S_{\text{rel}}\in[0,1]$ per box. The cross-attention design lets the same
+scorer handle all 14 tasks without per-task heads.
+
+\section{Training}
+Trained with a single binary-cross-entropy loss against IoU-derived 0/1
+labels (preferred-GT IoU $\geq 0.5 \Rightarrow $1). The optimiser is AdamW
+with separate learning rates for the FPN backbone ($5{\times}10^{-6}$),
+which is frozen for the first epoch, and for the scorer heads
+($5{\times}10^{-5}$). Gradient clipping at $\|g\|_2{\leq}1.0$. To catch the
+sharp validation-loss elbow we use \emph{sub-epoch validation}: each full
+pass is split into four 25\,\% shards, with a validation run after every
+shard. The best checkpoint is selected by the lowest validation BCE.
+
+\section{FPGA-readiness}
+TORCA was designed from the outset for our Genesys-2 (Kintex-7, 2~MB BRAM)
+target. The full inference system comprises \textbf{4.21~M parameters}:
+2.60~M frozen YOLOv11n detector plus 1.61~M task-specific modules (RoI
+fusion and scorer), with the 951~K backbone shared between detection and
+feature extraction on FPGA.
+(DDR3-resident).The static analyser reports \textbf{$\approx$3.4~GMACs/image}
+and a peak on-chip working set of \textbf{1.91~MB} BRAM peak \{\textbf{95.3\,\%} BRAM utilisation\}.
+
+% =====================================================================
+% PAGE 2 — RESULTS
+% =====================================================================
+\section{Quantitative results}
+
+\begin{table}[h]
+  \centering\small
+  \setlength{\tabcolsep}{4pt}
+  \renewcommand{\arraystretch}{1.10}
+  \begin{tabular}{l c c c}
+    \toprule
+    \textbf{Method} & \textbf{Top-1@0.5} & \textbf{mAP@0.5} & \textbf{Params} \\
+    \midrule
+    YOLO-only (max conf)            & 15.58\,\% & 8.95\,\%$^\dagger$ & --- \\
+    Sawatzky et al.~\cite{sawatzky2019} & 56.4\,\%  & 41.9\,\% & 25.5~M \\
+    \textbf{TORCA (ours)}    & \textbf{60.10\,\%} & \textbf{52.22\,\%} & \textbf{4.21~M} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Overall performance on the COCO-Tasks test split
+  ($N{=}6173$). TORCA beats both baselines with $\sim$6$\times$ fewer
+  parameters than Sawatzky et al.\ (task-specific scorer only: 1.61~M).
+  $^\dagger$YOLO mAP is reported for reference.}
+  \label{tab:overall}
+\end{table}
+
+Figure~\ref{fig:per_task} shows that the gain over a class-agnostic YOLO
+top-confidence baseline is large and uniform across every task. The highest
+gains are on tasks where the YOLO maximum-confidence box is almost always
+the wrong choice for the query --- e.g.\ \emph{Dig hole} (73.1\,\% vs.\
+7.5\,\%) and \emph{Pound carpet} (72.1\,\% vs.\ 9.3\,\%). The worst-performing
+tasks (\emph{Open parcel}, \emph{Smear butter}) are those with the
+smallest number of test samples and the most ambiguous preferred-object
+annotations.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{per_task_accuracy.png}
+  \caption{Per-task Top-1 accuracy at IoU $\geq 0.5$. TORCA (orange)
+  vs.\ a YOLO maximum-confidence baseline (blue) on each of the 14
+  COCO-Tasks queries.}
+  \label{fig:per_task}
+\end{figure*}
+
+\section{Qualitative result}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=.7\columnwidth]{qualitative_result.png}
+  \caption{TORCA on \emph{``sit comfortably''}. Green box: top-ranked
+  prediction ($S_{\text{final}}=0.42$, chair). Grey boxes: lower-ranked
+  YOLO detections. TORCA correctly deprioritises the highest-confidence
+  detection (person) in favour of the task-relevant seating object.}
+  \label{fig:qual}
+\end{figure}
+
+\section{Training behaviour}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\columnwidth]{loss_curve.png}
+  \caption{Training and validation BCE during the TORCA run, recorded at every
+  25\,\% shard. The validation curve bottoms at sub-epoch E2.4 (val=0.139)
+  and rises monotonically thereafter: the model memorises the training set
+  early, which is why sub-epoch validation is critical to capture the
+  optimal checkpoint.}
+  \label{fig:loss}
+\end{figure}
+
+\section{Conclusion}
+TORCA demonstrates that a task-conditional ranking head on top of a
+frozen detector --- using FPN-based multi-scale features and lightweight
+cross-attention reasoning --- reaches 60.1\,\% Top-1 / 52.2\,\% mAP on
+COCO-Tasks while remaining inside a 2~MB BRAM working-set budget. The complete codebase (training,
+evaluation, hardware analysis) is
+included in the submission package; the same model file is used for
+inference on CPU.
+
+\begin{thebibliography}{1}
+\bibitem{sawatzky2019}
+J.~Sawatzky, Y.~Souri, C.~Grund, and J.~Gall,
+``What Object Should I Use? — Task Driven Object Detection,''
+\emph{CVPR}, 2019.
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,336 @@
+"""
+TORCA: Task-conditioned Object Ranking via Cross-Attention
+==========================================================
+Architecture:
+  - YOLOv11n backbone (layers 0-8) extracts multi-scale FPN features:
+      P3 (stride  8): (B, 128, 80, 80)
+      P4 (stride 16): (B, 128, 40, 40)
+      P5 (stride 32): (B, 256, 20, 20)
+
+  - For each YOLO-detected object, RoI-Align extracts 7x7 features at
+    all three scales, GAP-pools and fuses into a 256-D per-object token.
+
+  - Class one-hot (80-D) projected and added for semantic context.
+
+  - Two layers of multi-head self-attention contextualise object tokens.
+
+  - A 1-token task embedding cross-attends over object tokens, producing
+    a per-object task-relevance score S_rel in [0,1].
+
+  - Final score: S_final = S_rel * S_yolo_conf  →  best box = argmax.
+
+Weight sharing: TORCA loads ONE YOLO instance. FPNBackbone wraps layers 0-8
+via nn.Sequential (same Python object references = shared weight tensors).
+YOLODetector receives the same YOLO instance via TORCA._shared_yolo.
+Unique parameters: ~4.21 M (2.60 M frozen YOLO + 1.61 M trainable modules).
+"""
+
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.ops import roi_align as tv_roi_align
+
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO_AVAILABLE = False
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_YOLO_PATH = os.environ.get(
+    "TORCA_YOLO_PATH",
+    os.path.join(CURRENT_DIR, "weights", "yolo11n.pt"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  FPN Backbone (YOLO layers 0-8, fine-tuned)
+# ─────────────────────────────────────────────────────────────────────
+class FPNBackbone(nn.Module):
+    """YOLO layers 0-8 with forward hooks to expose P3/P4/P5."""
+
+    HOOK_LAYERS = {4: "p3", 6: "p4", 8: "p5"}
+
+    def __init__(self, yolo_or_checkpoint=DEFAULT_YOLO_PATH):
+        super().__init__()
+        if isinstance(yolo_or_checkpoint, str):
+            chk_dir = os.path.dirname(yolo_or_checkpoint)
+            if chk_dir:
+                os.makedirs(chk_dir, exist_ok=True)
+            yolo = YOLO(yolo_or_checkpoint)
+        else:
+            yolo = yolo_or_checkpoint
+        # nn.Sequential stores the same layer objects as yolo.model.model,
+        # so weight tensors are shared — no extra memory for backbone weights.
+        self.backbone = nn.Sequential(*list(yolo.model.model.children())[:9])
+        self.out_channels = {"p3": 128, "p4": 128, "p5": 256}
+        self._feats: dict = {}
+        self._register_hooks()
+
+    def _register_hooks(self):
+        layers = list(self.backbone.children())
+        for idx, name in self.HOOK_LAYERS.items():
+            layers[idx].register_forward_hook(self._make_hook(name))
+
+    def _make_hook(self, name):
+        def hook(module, inp, out):
+            self._feats[name] = out
+        return hook
+
+    def forward(self, x):
+        self._feats = {}
+        _ = self.backbone(x)
+        return self._feats["p3"], self._feats["p4"], self._feats["p5"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Multi-Scale RoI Fusion
+# ─────────────────────────────────────────────────────────────────────
+class MultiScaleRoIFusion(nn.Module):
+    """
+    For each detected box: RoI-Align on P3/P4/P5 + class one-hot,
+    fused via MLP into a 256-D per-object embedding.
+    """
+
+    def __init__(self, in_channels: dict, embed_dim: int = 256,
+                 roi_size: int = 7, num_classes: int = 80):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.roi_size = roi_size
+        self.proj_p3 = nn.Conv2d(in_channels["p3"], embed_dim, 1)
+        self.proj_p4 = nn.Conv2d(in_channels["p4"], embed_dim, 1)
+        self.proj_p5 = nn.Conv2d(in_channels["p5"], embed_dim, 1)
+        self.class_proj = nn.Linear(num_classes, embed_dim)
+        self.fuse = nn.Sequential(
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, p3, p4, p5, det_results):
+        """
+        det_results : list of (boxes_xyxy [N_i,4], scores [N_i], classes [N_i])
+                      one tuple per image, boxes in 640-px xyxy space.
+        Returns
+          obj_feats  : [B, maxN, embed_dim]
+          det_scores : [B, maxN]  — YOLO detection confidence
+          mask       : [B, maxN]  — True = padding token (no real object)
+        """
+        B = p3.shape[0]
+        device = p3.device
+        num_classes = self.class_proj.in_features
+
+        p3 = self.proj_p3(p3)
+        p4 = self.proj_p4(p4)
+        p5 = self.proj_p5(p5)
+
+        rois_list, n_per = [], []
+        all_scores, all_onehot = [], []
+
+        for i, (boxes, scores, classes) in enumerate(det_results):
+            n = boxes.shape[0]
+            n_per.append(n)
+            if n > 0:
+                bidx = torch.full((n, 1), float(i), device=device)
+                rois_list.append(torch.cat([bidx, boxes.to(device)], dim=1))
+                all_scores.append(scores.to(device))
+                oh = torch.zeros(n, num_classes, device=device)
+                oh[torch.arange(n, device=device), classes.to(device)] = 1.0
+                all_onehot.append(oh)
+
+        maxN = max(max(n_per, default=0), 1)
+        obj_feats   = torch.zeros(B, maxN, self.embed_dim, device=device)
+        det_scores_ = torch.zeros(B, maxN, device=device)
+        mask        = torch.ones(B, maxN, dtype=torch.bool, device=device)
+
+        total = sum(n_per)
+        if total > 0:
+            rois           = torch.cat(rois_list, dim=0)
+            all_scores_cat = torch.cat(all_scores, dim=0)
+            all_onehot_cat = torch.cat(all_onehot, dim=0)
+
+            f3 = tv_roi_align(p3, rois, self.roi_size, spatial_scale=1/8,  aligned=True).mean([-2,-1])
+            f4 = tv_roi_align(p4, rois, self.roi_size, spatial_scale=1/16, aligned=True).mean([-2,-1])
+            f5 = tv_roi_align(p5, rois, self.roi_size, spatial_scale=1/32, aligned=True).mean([-2,-1])
+            fc = F.relu(self.class_proj(all_onehot_cat))
+            fused = self.fuse(torch.cat([f3, f4, f5, fc], dim=1))
+
+            ptr = 0
+            for i, n in enumerate(n_per):
+                if n > 0:
+                    obj_feats[i, :n]   = fused[ptr:ptr+n]
+                    det_scores_[i, :n] = all_scores_cat[ptr:ptr+n]
+                    mask[i, :n]        = False
+                else:
+                    mask[i, 0] = False
+                ptr += n
+        else:
+            for i in range(B):
+                mask[i, 0] = False
+
+        return obj_feats, det_scores_, mask
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Self-Attention Block (Pre-LN, with FFN)
+# ─────────────────────────────────────────────────────────────────────
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, dim: int, heads: int = 4):
+        super().__init__()
+        self.attn  = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.ff    = nn.Sequential(nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim))
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x, mask=None):
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=mask)
+        x = self.norm1(x + attn_out)
+        x = self.norm2(x + self.ff(x))
+        return x
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Task Object Scorer
+# ─────────────────────────────────────────────────────────────────────
+class TaskObjectScorer(nn.Module):
+    """Self-attention + task cross-attention → per-object relevance in [0,1]."""
+
+    def __init__(self, embed_dim: int = 256, num_tasks: int = 14,
+                 nhead: int = 4, num_layers: int = 2):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.task_embed = nn.Embedding(num_tasks + 1, embed_dim)   # 1-indexed
+        self.self_attn  = nn.ModuleList([
+            SelfAttentionBlock(embed_dim, nhead) for _ in range(num_layers)
+        ])
+        self.q_proj     = nn.Linear(embed_dim, embed_dim)
+        self.k_proj     = nn.Linear(embed_dim, embed_dim)
+        self.score_head = nn.Linear(embed_dim, 1)
+
+    def forward(self, obj_feats, task_id, mask=None):
+        """
+        obj_feats : [B, N, E]
+        task_id   : [B,] int, 1-indexed (1–14)
+        mask      : [B, N] bool — True = padding
+        Returns   : [B, N] per-object task-relevance scores in [0,1]
+        """
+        x = obj_feats
+        for layer in self.self_attn:
+            x = layer(x, mask)
+
+        task_emb = self.task_embed(task_id).unsqueeze(1)            # [B, 1, E]
+        Q = self.q_proj(task_emb)                                   # [B, 1, E]
+        K = self.k_proj(x)                                          # [B, N, E]
+        attn = torch.bmm(Q, K.transpose(1, 2)) / (self.embed_dim ** 0.5)
+
+        if mask is not None:
+            attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
+
+        weights  = torch.softmax(attn, dim=-1)                      # [B, 1, N]
+        attended = weights.transpose(1, 2) * x                      # [B, N, E]
+        return torch.sigmoid(self.score_head(attended).squeeze(-1)) # [B, N]
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  TORCA — Full Model
+# ─────────────────────────────────────────────────────────────────────
+class TORCA(nn.Module):
+    """
+    Task-conditioned Object Ranking via Cross-Attention.
+
+    Input : image tensor (B, 3, 640, 640) + det_results list + task_id (B,)
+    Output: rel_scores [B, maxN], det_scores [B, maxN], mask [B, maxN]
+
+    The final prediction is: argmax(rel_scores * det_scores) over valid boxes.
+
+    A single YOLO instance is loaded and exposed as _shared_yolo so that
+    callers can pass it to YOLODetector, avoiding duplicate weight storage.
+    """
+
+    def __init__(self, checkpoint=DEFAULT_YOLO_PATH,
+                 embed_dim: int = 256, num_tasks: int = 14, num_classes: int = 80):
+        super().__init__()
+        _yolo = YOLO(checkpoint)
+        # Freeze neck + detection head (layers 9+); backbone (0-8) stays trainable.
+        for i, layer in enumerate(_yolo.model.model):
+            if i >= 9:
+                for p in layer.parameters():
+                    p.requires_grad_(False)
+        # FPNBackbone shares weight tensors with _yolo via nn.Sequential references.
+        self.backbone   = FPNBackbone(_yolo)
+        self.roi_fusion = MultiScaleRoIFusion(
+            self.backbone.out_channels,
+            embed_dim=embed_dim,
+            num_classes=num_classes,
+        )
+        self.scorer    = TaskObjectScorer(embed_dim=embed_dim, num_tasks=num_tasks)
+        self.num_tasks = num_tasks
+        # Expose the shared YOLO instance so callers can pass it to YOLODetector.
+        object.__setattr__(self, '_shared_yolo', _yolo)
+
+    def forward(self, img_tensor, det_results, task_id):
+        p3, p4, p5                  = self.backbone(img_tensor)
+        obj_feats, det_scores, mask = self.roi_fusion(p3, p4, p5, det_results)
+        rel_scores                  = self.scorer(obj_feats, task_id, mask)
+        return rel_scores, det_scores, mask
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Frozen YOLO Detector Helper
+# ─────────────────────────────────────────────────────────────────────
+class YOLODetector:
+    """Frozen YOLOv11n wrapper. Not an nn.Module — weights are never updated.
+
+    Pass the TORCA._shared_yolo instance as `yolo_or_checkpoint` to avoid
+    loading a second copy of the YOLO weights.
+    """
+
+    def __init__(self, yolo_or_checkpoint=DEFAULT_YOLO_PATH, device="cpu"):
+        if not YOLO_AVAILABLE:
+            raise RuntimeError(
+                "ultralytics is not installed. Run: pip install ultralytics"
+            )
+        if isinstance(yolo_or_checkpoint, str):
+            yolo = YOLO(yolo_or_checkpoint)
+        else:
+            yolo = yolo_or_checkpoint
+        # Keep outside PyTorch module registry — Ultralytics overrides .train()
+        # to start training, which would conflict with model.train()/model.eval().
+        object.__setattr__(self, 'yolo', yolo)
+        self.device      = device
+        self.num_classes = int(yolo.model.model[-1].nc)
+
+    @torch.no_grad()
+    def detect_batch(self, pil_images):
+        """Returns list of (boxes_xyxy [N,4], scores [N], classes [N]) per image."""
+        out = []
+        for img in pil_images:
+            r       = self.yolo(img, verbose=False)[0]
+            boxes   = r.boxes.xyxy.to(self.device)
+            scores  = r.boxes.conf.to(self.device)
+            classes = r.boxes.cls.long().to(self.device)
+            out.append((boxes, scores, classes))
+        return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Smoke test
+# ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model  = TORCA().to(device)
+    total  = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"TORCA — trainable parameters: {total:,}")
+
+    B    = 2
+    img  = torch.randn(B, 3, 640, 640).to(device)
+    task = torch.tensor([2, 7]).to(device)
+    dets = [
+        (torch.rand(5, 4).to(device) * 640, torch.rand(5).to(device), torch.randint(0, 80, (5,)).to(device)),
+        (torch.rand(3, 4).to(device) * 640, torch.rand(3).to(device), torch.randint(0, 80, (3,)).to(device)),
+    ]
+    rel, det, mask = model(img, dets, task)
+    print(f"rel_scores: {rel.shape}, det_scores: {det.shape}, mask: {mask.shape}")
+    print("Smoke test passed.")

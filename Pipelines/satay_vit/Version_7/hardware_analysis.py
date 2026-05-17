@@ -1,7 +1,7 @@
 """
-hardware_analysis.py  –  V6 FPGA Resource Estimator
+hardware_analysis.py  –  V7 FPGA Resource Estimator
 =====================================================
-Profiles SATAYViT_V6 for:
+Profiles SATAYViT_V7 for:
   - Parameter count per module
   - Weight memory footprint (FP32 / INT8)
   - Activation memory high-water mark
@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from model import SATAYViT_V6, DEFAULT_YOLO_PATH
+from model import SATAYViT_V7, DEFAULT_YOLO_PATH
 
 KINTEX7_BRAM_BYTES = 2 * 1024 * 1024       # 2 MB on Genesys 2
 BYTES_FP32         = 4
@@ -89,7 +89,7 @@ def analyse(n_detections=10):
     """
     n_detections : typical number of YOLO boxes per image (10-20 is realistic).
     """
-    model = SATAYViT_V6(checkpoint=DEFAULT_YOLO_PATH)
+    model = SATAYViT_V7(checkpoint=DEFAULT_YOLO_PATH)
     model.eval()
 
     bb  = model.backbone
@@ -136,7 +136,7 @@ def analyse(n_detections=10):
     # FPN backbone (very rough — YOLOv11n layers 0-8)
     # Dominant layers: C3k2 at stride 32 (layer 8) with ~256 ch, 20×20 spatial
     macs_fpn_approx = (
-        macs_conv(3,   16,  3, 320, 320) +   # stride-2 → output is 320×320
+        macs_conv(3,   16,  3, 640, 640) +
         macs_conv(16,  32,  3, 320, 320) +
         macs_conv(32,  64,  3, 160, 160) +
         macs_conv(64,  64,  3, 160, 160) +
@@ -170,7 +170,7 @@ def analyse(n_detections=10):
 
     # ── BRAM fit analysis ─────────────────────────────────────────────
     # Layer-pipelined: only peak single-layer weights in BRAM at once.
-    # Biggest layer in V6 backbone: C3k2 at layer 8, ~256 ch
+    # Biggest layer in V7 backbone: C3k2 at layer 8, ~256 ch
     # Rough estimate: 256×256×3×3 (depthwise separate in C3k2) ≈ 0.25 M params
     peak_layer_params  = 256 * 256 * 3 * 3           # very conservative upper bound
     peak_layer_bram    = peak_layer_params * BYTES_INT8
@@ -186,7 +186,7 @@ def analyse(n_detections=10):
     # ── Print report ──────────────────────────────────────────────────
     div = "─" * 68
     print(f"\n{'='*68}")
-    print("  TORCA  —  FPGA Hardware Resource Analysis")
+    print("  SATAY-ViT V7  —  FPGA Hardware Resource Analysis")
     print(f"  Target: Genesys 2 (Kintex-7 XC7K325T, 2 MB BRAM)")
     print(f"  Assuming {n_detections} YOLO detections per image")
     print(f"{'='*68}")
@@ -252,7 +252,7 @@ def analyse(n_detections=10):
         ("Model",    "Params",    "INT8 Wts", "BRAM est.", "FPGA?",  "Top-1"),
         ("─"*10,     "─"*9,       "─"*9,      "─"*9,       "─"*6,    "─"*7),
         ("V3",       "~2.2 M",    "~2.2 MB",  "~1.2 MB",  "Yes ✓",  "51.5%"),
-        ("TORCA (ours)","2.56 M",  f"{fmt(w_int8)}", f"{fmt(total_bram_needed)}", "Yes ✓", "60.1%"),
+        ("V7 (ours)","2.56 M",     f"{fmt(w_int8)}", f"{fmt(total_bram_needed)}", "Yes ✓", "60.1%"),
         ("V1B",      "~29 M",     "~29 MB",   ">2 MB",    "No ✗",   "58.5%"),
     ]
     for r in rows:

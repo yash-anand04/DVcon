@@ -1,20 +1,23 @@
 """
-train.py  –  SATAY-ViT V6 Training Script
+train.py  –  SATAY-ViT V8 Training Script
 ==========================================
-Trains SATAYViT_V6 (FPN backbone + RoI-Align + task attention) jointly.
-YOLO detector stays frozen; FPN backbone is fine-tuned after freeze_epochs.
+Trains SATAYViT_V8 with CLIP student-teacher supervision:
 
-Chunked-epoch mode (--chunk-frac):
-  Instead of one full dataset pass per epoch, each full epoch is split into
-  N sequential shards.  Validation runs after every shard so the best
-  checkpoint is saved at sub-epoch granularity.  This prevents the model from
-  memorising the entire training set before validation can catch overfitting.
+  * YOLO detector stays frozen (object localisation).
+  * FPN backbone is fine-tuned after freeze_epochs.
+  * Targets come from a frozen CLIP ViT-B/32 teacher:
+      crop each detected box → CLIP image encoder → cosine-sim against
+      CLIP-encoded task text → soft per-box relevance score in roughly
+      [-0.1, 0.4], normalised per-image to [0, 1] before BCE/focal loss.
 
-  Example: --chunk-frac 0.2  →  5 shards per epoch, 5× more val checks.
+  At inference time CLIP is NOT used — the student has internalised the
+  ranking signal.
+
+Chunked-epoch mode (--chunk-frac): same as V7 (sub-epoch validation).
 
 Usage:
-    python train.py [--epochs N] [--batch B] [--lr LR] [--freeze-epochs N]
-                    [--chunk-frac F]
+    python train.py [--epochs N] [--batch B] [--clip-temp T]
+                    [--clip-weight W] [--freeze-epochs N] [--chunk-frac F]
 """
 
 import argparse
@@ -31,8 +34,10 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from model import DEFAULT_YOLO_PATH, SATAYViT_V6, YOLODetector
+from model import DEFAULT_YOLO_PATH, SATAYViT_V8, YOLODetector
+from clip_teacher import CLIPTeacher
 from utils.data_loader import COCOTasksDataset, custom_collate
 from utils.plot_metrics import plot_training_losses
 
@@ -50,9 +55,17 @@ DEFAULTS = dict(
     num_workers    = 4,
     embed_dim      = 256,
     iou_threshold  = 0.5,
-    chunk_frac     = 0.2,   # 1.0 = standard full-epoch mode
+    chunk_frac     = 0.2,    # 1.0 = standard full-epoch mode
     focal_gamma    = 2.0,
     focal_alpha    = 0.25,
+    soft_targets   = True,   # used only when clip_weight < 1 (IoU side of the mix)
+    clip_proj_lr   = 5e-5,
+    patience       = 6,
+    min_delta      = 1e-5,
+    # ── V8-specific knobs ────────────────────────────────────────────
+    clip_weight    = 1.0,    # 1.0 = pure CLIP targets, 0.0 = pure IoU targets, in between = blend
+    clip_temp      = 0.07,   # softmax temperature for CLIP scores → softer with higher T
+    clip_target    = "minmax",  # "minmax" | "softmax" | "raw"
 )
 
 
@@ -86,16 +99,18 @@ def load_pil_images(paths):
 # ─────────────────────────────────────────────────────────────────────
 #  Target builder
 # ─────────────────────────────────────────────────────────────────────
-def build_targets(batch, det_results, mask, iou_threshold, device):
+def build_targets(batch, det_results, mask, iou_threshold, device, soft=False):
     """
     Returns
-      targets [B, maxN] : soft IoU score clamped to [0,1] for each detected box
-                          (boxes below iou_threshold get 0; above get their exact IoU)
+      targets [B, maxN] : default — hard 0/1 (1.0 if IoU>=thresh else 0.0)
+                          if soft=True, returns the exact IoU score for boxes
+                          above the threshold and 0 otherwise.
       valid   [B, maxN] : True where position is a real detection (not padding)
 
-    Soft targets give the model a gradient signal that distinguishes a
-    near-perfect overlap (IoU=0.95) from a borderline positive (IoU=0.51),
-    smoothing the loss landscape compared to hard 0/1 labels.
+    Hard targets keep the model's argmax sharp (good for Top-1).  Soft targets
+    are better-calibrated (good for mAP) but smear the score for borderline
+    positives, which can flip the argmax.  V7 defaults to hard targets after
+    measuring a Top-1 regression from soft mode.
     """
     B    = len(det_results)
     maxN = mask.shape[1]
@@ -119,12 +134,69 @@ def build_targets(batch, det_results, mask, iou_threshold, device):
         n_b      = min(boxes_b.shape[0], maxN)
         det_xyxy = boxes_b[:n_b].to(device)
         ious     = pairwise_iou_xyxy(det_xyxy, preferred_xyxy)
-        max_iou  = ious.max(dim=1).values          # [n_b]  best IoU to any preferred GT
-        # Zero out boxes below threshold; keep exact IoU for those above
-        soft = max_iou * (max_iou >= iou_threshold).float()
-        targets[b, :n_b] = soft
+        max_iou  = ious.max(dim=1).values
+        above    = (max_iou >= iou_threshold).float()
+        targets[b, :n_b] = (max_iou * above) if soft else above
 
     return targets, valid
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  CLIP teacher targets
+# ─────────────────────────────────────────────────────────────────────
+def build_clip_targets(pil_images_640, det_results, mask, task_ids,
+                       teacher, device, mode="minmax", temperature=0.07):
+    """
+    Soft per-box targets from a frozen CLIP teacher.
+
+    For each image:
+        sims_i = CLIP_image(crop_j) · CLIP_text(task)  for each detected box j
+
+    Conversion to a [0, 1] BCE-compatible target:
+      mode='minmax'  : (sim - sim.min) / (sim.max - sim.min)  per-image
+      mode='softmax' : softmax(sim / temperature)             per-image (sums to 1)
+      mode='raw'     : sims clamped to [0, 1] then used as-is (rarely useful — CLIP sims are tiny)
+
+    Returns
+      targets [B, maxN] : float in [0,1], 0 for padding/no-detection slots
+      valid   [B, maxN] : True where slot is a real detection
+    """
+    B    = len(det_results)
+    maxN = mask.shape[1]
+    targets = torch.zeros(B, maxN, device=device)
+    valid   = ~mask
+
+    # Run CLIP image encoder for the whole batch in a single forward
+    boxes_per_image = [det_results[b][0][:maxN] for b in range(B)]
+    sims_per_image  = teacher.score_batch(pil_images_640, boxes_per_image,
+                                          [int(t.item()) for t in task_ids])
+
+    for b in range(B):
+        sims = sims_per_image[b]
+        n_b  = sims.shape[0]
+        if n_b == 0:
+            continue
+
+        if mode == "softmax":
+            tgt = torch.softmax(sims / max(temperature, 1e-6), dim=0)
+            tgt = tgt / tgt.max().clamp(min=1e-6)          # renormalise so peak = 1
+        elif mode == "raw":
+            tgt = sims.clamp(0.0, 1.0)
+        else:  # "minmax"
+            s_min, s_max = sims.min(), sims.max()
+            if (s_max - s_min) > 1e-6:
+                tgt = (sims - s_min) / (s_max - s_min)
+            else:
+                tgt = torch.full_like(sims, 0.5)
+
+        targets[b, :n_b] = tgt.to(device)
+
+    return targets, valid
+
+
+def blend_targets(clip_t, iou_t, w):
+    """Convex combination: w=1 → pure CLIP, w=0 → pure IoU."""
+    return w * clip_t + (1.0 - w) * iou_t
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -148,15 +220,24 @@ def focal_loss(pred, target, gamma=2.0, alpha=0.25):
 # ─────────────────────────────────────────────────────────────────────
 #  Optimizer with separate backbone / head LRs
 # ─────────────────────────────────────────────────────────────────────
-def build_optimizer(model, lr, backbone_lr):
-    backbone_params = list(model.backbone.parameters())
-    head_params = (
-        list(model.roi_fusion.parameters()) +
-        list(model.scorer.parameters())
-    )
+def build_optimizer(model, lr, backbone_lr, clip_proj_lr):
+    """
+    Three parameter groups:
+      backbone  : YOLO FPN layers     (lr = backbone_lr, frozen for freeze_epochs)
+      clip_proj : task_proj Linear    (lr = clip_proj_lr — lower, to preserve CLIP structure)
+      head      : everything else     (lr = lr — full head LR)
+    """
+    backbone_params  = list(model.backbone.parameters())
+    clip_proj_params = list(model.scorer.task_proj.parameters())
+    clip_proj_ids    = {id(p) for p in clip_proj_params}
+    head_params = [
+        p for p in list(model.roi_fusion.parameters()) + list(model.scorer.parameters())
+        if id(p) not in clip_proj_ids
+    ]
     return optim.AdamW(
-        [{"params": backbone_params, "lr": backbone_lr},
-         {"params": head_params,     "lr": lr}],
+        [{"params": backbone_params,  "lr": backbone_lr},
+         {"params": clip_proj_params, "lr": clip_proj_lr},
+         {"params": head_params,      "lr": lr}],
         weight_decay=1e-4,
     )
 
@@ -169,10 +250,16 @@ def set_backbone_grad(model, requires_grad: bool):
 # ─────────────────────────────────────────────────────────────────────
 #  Single loader pass (train or val)
 # ─────────────────────────────────────────────────────────────────────
-def run_epoch(model, detector, loader, criterion, optimizer, cfg, device, train=True):
+def run_epoch(model, detector, loader, criterion, optimizer, cfg, device,
+              teacher=None, train=True):
     model.train(train)
     total_loss, total_steps = 0.0, 0
     desc = "Train" if train else "Valid"
+
+    clip_weight = float(cfg.get("clip_weight", 1.0))
+    clip_temp   = float(cfg.get("clip_temp", 0.07))
+    clip_mode   = cfg.get("clip_target", "minmax")
+    use_clip    = (teacher is not None) and (clip_weight > 0.0)
 
     for batch in tqdm(loader, desc=desc, leave=False):
         pil_images  = load_pil_images(batch["image_paths"])
@@ -183,7 +270,25 @@ def run_epoch(model, detector, loader, criterion, optimizer, cfg, device, train=
             det_results = detector.detect_batch(pil_images)
 
         rel_scores, _, mask = model(img_tensors, det_results, task_ids)
-        targets, valid = build_targets(batch, det_results, mask, cfg["iou_threshold"], device)
+
+        # Build targets — pure CLIP, pure IoU, or a blend
+        if use_clip:
+            pil_640 = [img.resize((640, 640)) for img in pil_images]
+            clip_t, valid = build_clip_targets(
+                pil_640, det_results, mask, task_ids, teacher, device,
+                mode=clip_mode, temperature=clip_temp,
+            )
+            if clip_weight < 1.0:
+                iou_t, _ = build_targets(batch, det_results, mask,
+                                          cfg["iou_threshold"], device,
+                                          soft=cfg.get("soft_targets", True))
+                targets = blend_targets(clip_t, iou_t, clip_weight)
+            else:
+                targets = clip_t
+        else:
+            targets, valid = build_targets(batch, det_results, mask,
+                                            cfg["iou_threshold"], device,
+                                            soft=cfg.get("soft_targets", True))
 
         if not valid.any():
             continue
@@ -251,16 +356,24 @@ def train(cfg):
     )
 
     detector = YOLODetector(checkpoint=cfg["yolo_model"], device=device)
-    model    = SATAYViT_V6(
+    model    = SATAYViT_V8(
         checkpoint=cfg["yolo_model"],
         embed_dim=cfg["embed_dim"],
     ).to(device)
 
-    criterion = lambda p, t: focal_loss(p, t, gamma=cfg["focal_gamma"], alpha=cfg["focal_alpha"])
-    optimizer = build_optimizer(model, cfg["lr"], cfg["backbone_lr"])
+    # Frozen CLIP teacher — only used during training to produce targets.
+    teacher = None
+    if cfg.get("clip_weight", 1.0) > 0.0:
+        print("Loading CLIP teacher (ViT-B/32) …")
+        teacher = CLIPTeacher(device=device)
+        print(f"CLIP teacher ready. Target mode: '{cfg['clip_target']}'  "
+              f"weight: {cfg['clip_weight']}  temp: {cfg['clip_temp']}")
 
-    latest_path = os.path.join(cfg["weights_dir"], "v6_latest.pt")
-    best_path   = os.path.join(cfg["weights_dir"], "v6_best.pt")
+    criterion = lambda p, t: focal_loss(p, t, gamma=cfg["focal_gamma"], alpha=cfg["focal_alpha"])
+    optimizer = build_optimizer(model, cfg["lr"], cfg["backbone_lr"], cfg["clip_proj_lr"])
+
+    latest_path = os.path.join(cfg["weights_dir"], "v8_latest.pt")
+    best_path   = os.path.join(cfg["weights_dir"], "v8_best.pt")
 
     start_epoch   = 0
     best_val      = float("inf")
@@ -296,7 +409,17 @@ def train(cfg):
     else:
         print("Standard full-epoch mode.")
 
+    # Early-stopping state
+    patience    = int(cfg["patience"])
+    min_delta   = float(cfg["min_delta"])
+    bad_steps   = 0
+    stop_early  = False
+    print(f"Early stopping: patience={patience} non-improving val steps "
+          f"(min Δ={min_delta:.0e})")
+
     for full_epoch in range(start_epoch, cfg["epochs"]):
+        if stop_early:
+            break
 
         if full_epoch == freeze_epochs:
             set_backbone_grad(model, True)
@@ -321,17 +444,17 @@ def train(cfg):
                 )
                 train_loss = run_epoch(
                     model, detector, shard_loader, criterion, optimizer,
-                    cfg, device, train=True,
+                    cfg, device, teacher=teacher, train=True,
                 )
             else:
                 train_loss = run_epoch(
                     model, detector, full_train_loader, criterion, optimizer,
-                    cfg, device, train=True,
+                    cfg, device, teacher=teacher, train=True,
                 )
 
             val_loss = run_epoch(
                 model, detector, val_loader, criterion, optimizer,
-                cfg, device, train=False,
+                cfg, device, teacher=teacher, train=False,
             )
 
             train_history.append(train_loss)
@@ -349,10 +472,14 @@ def train(cfg):
             }
             torch.save(ckpt, latest_path)
 
-            if val_loss < best_val:
-                best_val = val_loss
+            if val_loss < best_val - min_delta:
+                best_val  = val_loss
+                bad_steps = 0
                 torch.save(ckpt, best_path)
                 print(f"  -> Best checkpoint saved (val={best_val:.4f})")
+            else:
+                bad_steps += 1
+                print(f"  -> No improvement ({bad_steps}/{patience} bad val steps)")
 
             with open(os.path.join(cfg["weights_dir"], "training_history.json"), "w") as f:
                 json.dump({
@@ -361,6 +488,12 @@ def train(cfg):
                     "labels":        step_labels,
                     "best_val_loss": best_val,
                 }, f, indent=2)
+
+            if bad_steps >= patience:
+                print(f"\nEarly stopping: val loss did not improve for "
+                      f"{patience} consecutive steps. Best val={best_val:.4f}")
+                stop_early = True
+                break
 
     plot_path = plot_training_losses(train_history, val_history, save_dir=cfg["weights_dir"])
     print(f"\nDone. Best val loss: {best_val:.4f}")
@@ -390,6 +523,21 @@ if __name__ == "__main__":
     parser.add_argument("--focal-gamma",   type=float, default=DEFAULTS["focal_gamma"],
                         help="Focal loss focusing exponent (0=plain BCE, 2=standard).")
     parser.add_argument("--focal-alpha",   type=float, default=DEFAULTS["focal_alpha"],
-                        help="Focal loss prior weight for positives (0.25 standard).")
+                        help="Focal loss prior weight for positives (0.75 default for ~7% positive rate).")
+    parser.add_argument("--soft-targets",  action="store_true",
+                        help="Use soft IoU targets instead of hard 0/1 (better mAP, worse Top-1).")
+    parser.add_argument("--clip-proj-lr",  type=float, default=DEFAULTS["clip_proj_lr"],
+                        help="LR for the CLIP→embed_dim projection layer (smaller preserves CLIP semantics).")
+    parser.add_argument("--patience",      type=int,   default=DEFAULTS["patience"],
+                        help="Early-stop after this many consecutive non-improving val steps.")
+    parser.add_argument("--min-delta",     type=float, default=DEFAULTS["min_delta"],
+                        help="Minimum val-loss improvement to reset the early-stop counter.")
+    parser.add_argument("--clip-weight",   type=float, default=DEFAULTS["clip_weight"],
+                        help="Mix factor for CLIP targets: 1.0 = pure CLIP, 0.0 = pure IoU.")
+    parser.add_argument("--clip-temp",     type=float, default=DEFAULTS["clip_temp"],
+                        help="Temperature for softmax-mode CLIP targets (lower = sharper).")
+    parser.add_argument("--clip-target",   type=str,   default=DEFAULTS["clip_target"],
+                        choices=["minmax", "softmax", "raw"],
+                        help="How to convert CLIP cosine sims into [0,1] targets.")
     args = parser.parse_args()
     train({**DEFAULTS, **{k.replace("-", "_"): v for k, v in vars(args).items()}})

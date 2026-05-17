@@ -1,7 +1,7 @@
 """
-train.py  –  SATAY-ViT V6 Training Script
+train.py  –  SATAY-ViT V7 Training Script
 ==========================================
-Trains SATAYViT_V6 (FPN backbone + RoI-Align + task attention) jointly.
+Trains SATAYViT_V7 (FPN backbone + RoI-Align + task attention) jointly.
 YOLO detector stays frozen; FPN backbone is fine-tuned after freeze_epochs.
 
 Chunked-epoch mode (--chunk-frac):
@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from model import DEFAULT_YOLO_PATH, SATAYViT_V6, YOLODetector
+from model import DEFAULT_YOLO_PATH, SATAYViT_V7, YOLODetector
 from utils.data_loader import COCOTasksDataset, custom_collate
 from utils.plot_metrics import plot_training_losses
 
@@ -50,9 +50,13 @@ DEFAULTS = dict(
     num_workers    = 4,
     embed_dim      = 256,
     iou_threshold  = 0.5,
-    chunk_frac     = 0.2,   # 1.0 = standard full-epoch mode
+    chunk_frac     = 0.2,    # 1.0 = standard full-epoch mode
     focal_gamma    = 2.0,
-    focal_alpha    = 0.25,
+    focal_alpha    = 0.25,   # restored: the prior recommendation (0.75) starved the model and hurt convergence
+    soft_targets   = True,   # restored: hard targets alone didn't compensate for the slowed CLIP projection
+    clip_proj_lr   = 5e-5,   # same as head LR — the critical new layer needs full-speed training
+    patience       = 6,      # early-stop after this many consecutive non-improving validation steps
+    min_delta      = 1e-5,   # val loss must improve by at least this to count as "improvement"
 )
 
 
@@ -86,16 +90,18 @@ def load_pil_images(paths):
 # ─────────────────────────────────────────────────────────────────────
 #  Target builder
 # ─────────────────────────────────────────────────────────────────────
-def build_targets(batch, det_results, mask, iou_threshold, device):
+def build_targets(batch, det_results, mask, iou_threshold, device, soft=False):
     """
     Returns
-      targets [B, maxN] : soft IoU score clamped to [0,1] for each detected box
-                          (boxes below iou_threshold get 0; above get their exact IoU)
+      targets [B, maxN] : default — hard 0/1 (1.0 if IoU>=thresh else 0.0)
+                          if soft=True, returns the exact IoU score for boxes
+                          above the threshold and 0 otherwise.
       valid   [B, maxN] : True where position is a real detection (not padding)
 
-    Soft targets give the model a gradient signal that distinguishes a
-    near-perfect overlap (IoU=0.95) from a borderline positive (IoU=0.51),
-    smoothing the loss landscape compared to hard 0/1 labels.
+    Hard targets keep the model's argmax sharp (good for Top-1).  Soft targets
+    are better-calibrated (good for mAP) but smear the score for borderline
+    positives, which can flip the argmax.  V7 defaults to hard targets after
+    measuring a Top-1 regression from soft mode.
     """
     B    = len(det_results)
     maxN = mask.shape[1]
@@ -119,10 +125,9 @@ def build_targets(batch, det_results, mask, iou_threshold, device):
         n_b      = min(boxes_b.shape[0], maxN)
         det_xyxy = boxes_b[:n_b].to(device)
         ious     = pairwise_iou_xyxy(det_xyxy, preferred_xyxy)
-        max_iou  = ious.max(dim=1).values          # [n_b]  best IoU to any preferred GT
-        # Zero out boxes below threshold; keep exact IoU for those above
-        soft = max_iou * (max_iou >= iou_threshold).float()
-        targets[b, :n_b] = soft
+        max_iou  = ious.max(dim=1).values
+        above    = (max_iou >= iou_threshold).float()
+        targets[b, :n_b] = (max_iou * above) if soft else above
 
     return targets, valid
 
@@ -148,15 +153,24 @@ def focal_loss(pred, target, gamma=2.0, alpha=0.25):
 # ─────────────────────────────────────────────────────────────────────
 #  Optimizer with separate backbone / head LRs
 # ─────────────────────────────────────────────────────────────────────
-def build_optimizer(model, lr, backbone_lr):
-    backbone_params = list(model.backbone.parameters())
-    head_params = (
-        list(model.roi_fusion.parameters()) +
-        list(model.scorer.parameters())
-    )
+def build_optimizer(model, lr, backbone_lr, clip_proj_lr):
+    """
+    Three parameter groups:
+      backbone  : YOLO FPN layers     (lr = backbone_lr, frozen for freeze_epochs)
+      clip_proj : task_proj Linear    (lr = clip_proj_lr — lower, to preserve CLIP structure)
+      head      : everything else     (lr = lr — full head LR)
+    """
+    backbone_params  = list(model.backbone.parameters())
+    clip_proj_params = list(model.scorer.task_proj.parameters())
+    clip_proj_ids    = {id(p) for p in clip_proj_params}
+    head_params = [
+        p for p in list(model.roi_fusion.parameters()) + list(model.scorer.parameters())
+        if id(p) not in clip_proj_ids
+    ]
     return optim.AdamW(
-        [{"params": backbone_params, "lr": backbone_lr},
-         {"params": head_params,     "lr": lr}],
+        [{"params": backbone_params,  "lr": backbone_lr},
+         {"params": clip_proj_params, "lr": clip_proj_lr},
+         {"params": head_params,      "lr": lr}],
         weight_decay=1e-4,
     )
 
@@ -183,7 +197,8 @@ def run_epoch(model, detector, loader, criterion, optimizer, cfg, device, train=
             det_results = detector.detect_batch(pil_images)
 
         rel_scores, _, mask = model(img_tensors, det_results, task_ids)
-        targets, valid = build_targets(batch, det_results, mask, cfg["iou_threshold"], device)
+        targets, valid = build_targets(batch, det_results, mask, cfg["iou_threshold"], device,
+                                        soft=cfg.get("soft_targets", False))
 
         if not valid.any():
             continue
@@ -251,16 +266,16 @@ def train(cfg):
     )
 
     detector = YOLODetector(checkpoint=cfg["yolo_model"], device=device)
-    model    = SATAYViT_V6(
+    model    = SATAYViT_V7(
         checkpoint=cfg["yolo_model"],
         embed_dim=cfg["embed_dim"],
     ).to(device)
 
     criterion = lambda p, t: focal_loss(p, t, gamma=cfg["focal_gamma"], alpha=cfg["focal_alpha"])
-    optimizer = build_optimizer(model, cfg["lr"], cfg["backbone_lr"])
+    optimizer = build_optimizer(model, cfg["lr"], cfg["backbone_lr"], cfg["clip_proj_lr"])
 
-    latest_path = os.path.join(cfg["weights_dir"], "v6_latest.pt")
-    best_path   = os.path.join(cfg["weights_dir"], "v6_best.pt")
+    latest_path = os.path.join(cfg["weights_dir"], "v7_latest.pt")
+    best_path   = os.path.join(cfg["weights_dir"], "v7_best.pt")
 
     start_epoch   = 0
     best_val      = float("inf")
@@ -296,7 +311,17 @@ def train(cfg):
     else:
         print("Standard full-epoch mode.")
 
+    # Early-stopping state
+    patience    = int(cfg["patience"])
+    min_delta   = float(cfg["min_delta"])
+    bad_steps   = 0
+    stop_early  = False
+    print(f"Early stopping: patience={patience} non-improving val steps "
+          f"(min Δ={min_delta:.0e})")
+
     for full_epoch in range(start_epoch, cfg["epochs"]):
+        if stop_early:
+            break
 
         if full_epoch == freeze_epochs:
             set_backbone_grad(model, True)
@@ -349,10 +374,14 @@ def train(cfg):
             }
             torch.save(ckpt, latest_path)
 
-            if val_loss < best_val:
-                best_val = val_loss
+            if val_loss < best_val - min_delta:
+                best_val  = val_loss
+                bad_steps = 0
                 torch.save(ckpt, best_path)
                 print(f"  -> Best checkpoint saved (val={best_val:.4f})")
+            else:
+                bad_steps += 1
+                print(f"  -> No improvement ({bad_steps}/{patience} bad val steps)")
 
             with open(os.path.join(cfg["weights_dir"], "training_history.json"), "w") as f:
                 json.dump({
@@ -361,6 +390,12 @@ def train(cfg):
                     "labels":        step_labels,
                     "best_val_loss": best_val,
                 }, f, indent=2)
+
+            if bad_steps >= patience:
+                print(f"\nEarly stopping: val loss did not improve for "
+                      f"{patience} consecutive steps. Best val={best_val:.4f}")
+                stop_early = True
+                break
 
     plot_path = plot_training_losses(train_history, val_history, save_dir=cfg["weights_dir"])
     print(f"\nDone. Best val loss: {best_val:.4f}")
@@ -390,6 +425,14 @@ if __name__ == "__main__":
     parser.add_argument("--focal-gamma",   type=float, default=DEFAULTS["focal_gamma"],
                         help="Focal loss focusing exponent (0=plain BCE, 2=standard).")
     parser.add_argument("--focal-alpha",   type=float, default=DEFAULTS["focal_alpha"],
-                        help="Focal loss prior weight for positives (0.25 standard).")
+                        help="Focal loss prior weight for positives (0.75 default for ~7% positive rate).")
+    parser.add_argument("--soft-targets",  action="store_true",
+                        help="Use soft IoU targets instead of hard 0/1 (better mAP, worse Top-1).")
+    parser.add_argument("--clip-proj-lr",  type=float, default=DEFAULTS["clip_proj_lr"],
+                        help="LR for the CLIP→embed_dim projection layer (smaller preserves CLIP semantics).")
+    parser.add_argument("--patience",      type=int,   default=DEFAULTS["patience"],
+                        help="Early-stop after this many consecutive non-improving val steps.")
+    parser.add_argument("--min-delta",     type=float, default=DEFAULTS["min_delta"],
+                        help="Minimum val-loss improvement to reset the early-stop counter.")
     args = parser.parse_args()
     train({**DEFAULTS, **{k.replace("-", "_"): v for k, v in vars(args).items()}})

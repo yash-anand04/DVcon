@@ -1,20 +1,18 @@
 """
-train.py  –  SATAY-ViT V6 Training Script
-==========================================
-Trains SATAYViT_V6 (FPN backbone + RoI-Align + task attention) jointly.
-YOLO detector stays frozen; FPN backbone is fine-tuned after freeze_epochs.
+train.py — TORCA Training Script
+=================================
+Trains TORCA (FPN backbone + RoI-Align + task cross-attention scorer).
+The YOLO detector stays frozen; the FPN backbone is fine-tuned after
+freeze_epochs full epochs.
 
-Chunked-epoch mode (--chunk-frac):
-  Instead of one full dataset pass per epoch, each full epoch is split into
-  N sequential shards.  Validation runs after every shard so the best
-  checkpoint is saved at sub-epoch granularity.  This prevents the model from
-  memorising the entire training set before validation can catch overfitting.
-
-  Example: --chunk-frac 0.2  →  5 shards per epoch, 5× more val checks.
+Sub-epoch validation (--chunk-frac):
+  Each full epoch is split into N shards. Validation runs after every shard,
+  allowing the best checkpoint to be captured before overfitting diverges.
+  Example: --chunk-frac 0.25  →  4 shards per epoch.
 
 Usage:
-    python train.py [--epochs N] [--batch B] [--lr LR] [--freeze-epochs N]
-                    [--chunk-frac F]
+    python train.py --data-root /path/to/Data_Preprocessed
+    python train.py --data-root /path/to/Data_Preprocessed --epochs 15 --batch 8
 """
 
 import argparse
@@ -30,34 +28,31 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+# Make model and utils importable from this directory
+THIS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, THIS)
 
-from model import DEFAULT_YOLO_PATH, SATAYViT_V6, YOLODetector
+from model import DEFAULT_YOLO_PATH, TORCA, YOLODetector
 from utils.data_loader import COCOTasksDataset, custom_collate
 from utils.plot_metrics import plot_training_losses
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 DEFAULTS = dict(
-    data_root      = "e:/DVcon/DVcon/Data_Preprocessed",
-    weights_dir    = os.path.join(CURRENT_DIR, "weights"),
-    yolo_model     = DEFAULT_YOLO_PATH,
+    data_root      = os.path.join(THIS, "data"),   # override with --data-root
+    weights_dir    = os.path.join(THIS, "weights"),
+    yolo_weights   = DEFAULT_YOLO_PATH,
     epochs         = 15,
     batch          = 8,
     lr             = 5e-5,
     backbone_lr    = 5e-6,
     freeze_epochs  = 3,
     num_workers    = 4,
-    embed_dim      = 256,
     iou_threshold  = 0.5,
-    chunk_frac     = 0.2,   # 1.0 = standard full-epoch mode
-    focal_gamma    = 2.0,
-    focal_alpha    = 0.25,
+    chunk_frac     = 0.25,   # 1.0 = standard full-epoch mode
 )
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Box utilities
+#  Geometry utilities
 # ─────────────────────────────────────────────────────────────────────
 def xywh_to_xyxy(boxes):
     out = boxes.clone()
@@ -74,8 +69,8 @@ def pairwise_iou_xyxy(boxes1, boxes2):
     x2 = torch.min(boxes1[:, None, 2], boxes2[None, :, 2])
     y2 = torch.min(boxes1[:, None, 3], boxes2[None, :, 3])
     inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-    a1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
-    a2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    a1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(0)
+    a2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(0)
     return inter / (a1[:, None] + a2[None, :] - inter + 1e-6)
 
 
@@ -84,18 +79,14 @@ def load_pil_images(paths):
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Target builder
+#  Target builder — hard 0/1 labels
 # ─────────────────────────────────────────────────────────────────────
 def build_targets(batch, det_results, mask, iou_threshold, device):
     """
-    Returns
-      targets [B, maxN] : soft IoU score clamped to [0,1] for each detected box
-                          (boxes below iou_threshold get 0; above get their exact IoU)
-      valid   [B, maxN] : True where position is a real detection (not padding)
-
-    Soft targets give the model a gradient signal that distinguishes a
-    near-perfect overlap (IoU=0.95) from a borderline positive (IoU=0.51),
-    smoothing the loss landscape compared to hard 0/1 labels.
+    Returns:
+      targets [B, maxN] : 1 if the detected box overlaps a preferred GT at
+                          >= iou_threshold, else 0.
+      valid   [B, maxN] : True where the position holds a real detection.
     """
     B    = len(det_results)
     maxN = mask.shape[1]
@@ -106,47 +97,24 @@ def build_targets(batch, det_results, mask, iou_threshold, device):
         gt_boxes  = batch["boxes"][b].to(device)
         prefs     = batch["prefs"][b].to(device)
         preferred = gt_boxes[prefs == 1]
-
         if preferred.numel() == 0:
             continue
 
         preferred_xyxy = xywh_to_xyxy(preferred)
         boxes_b, _, _  = det_results[b]
-
         if boxes_b.shape[0] == 0:
             continue
 
         n_b      = min(boxes_b.shape[0], maxN)
         det_xyxy = boxes_b[:n_b].to(device)
         ious     = pairwise_iou_xyxy(det_xyxy, preferred_xyxy)
-        max_iou  = ious.max(dim=1).values          # [n_b]  best IoU to any preferred GT
-        # Zero out boxes below threshold; keep exact IoU for those above
-        soft = max_iou * (max_iou >= iou_threshold).float()
-        targets[b, :n_b] = soft
+        targets[b, :n_b] = (ious.max(dim=1).values >= iou_threshold).float()
 
     return targets, valid
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Focal loss
-# ─────────────────────────────────────────────────────────────────────
-def focal_loss(pred, target, gamma=2.0, alpha=0.25):
-    """
-    Binary focal loss.  Reduces the contribution of easy negatives
-    (the ~14 clearly-wrong boxes per image) so gradients focus on
-    hard / borderline examples.
-
-    alpha  : prior weight for the positive class (0.25 is standard)
-    gamma  : focusing exponent; 0 → plain BCE, 2 is standard
-    """
-    bce   = torch.nn.functional.binary_cross_entropy(pred, target, reduction="none")
-    p_t   = pred * target + (1 - pred) * (1 - target)
-    alpha_t = alpha * target + (1 - alpha) * (1 - target)
-    return (alpha_t * (1 - p_t) ** gamma * bce).mean()
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Optimizer with separate backbone / head LRs
+#  Optimizer — separate learning rates for backbone vs scorer heads
 # ─────────────────────────────────────────────────────────────────────
 def build_optimizer(model, lr, backbone_lr):
     backbone_params = list(model.backbone.parameters())
@@ -167,14 +135,14 @@ def set_backbone_grad(model, requires_grad: bool):
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Single loader pass (train or val)
+#  Single forward pass (train or val)
 # ─────────────────────────────────────────────────────────────────────
-def run_epoch(model, detector, loader, criterion, optimizer, cfg, device, train=True):
+def run_epoch(model, detector, loader, optimizer, cfg, device, train=True):
     model.train(train)
     total_loss, total_steps = 0.0, 0
-    desc = "Train" if train else "Valid"
+    criterion = torch.nn.functional.binary_cross_entropy
 
-    for batch in tqdm(loader, desc=desc, leave=False):
+    for batch in tqdm(loader, desc="Train" if train else "Valid", leave=False):
         pil_images  = load_pil_images(batch["image_paths"])
         img_tensors = batch["image"].to(device)
         task_ids    = batch["task_id"].to(device)
@@ -203,19 +171,14 @@ def run_epoch(model, detector, loader, criterion, optimizer, cfg, device, train=
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Chunk helper: split shuffled indices into N equal shards
+#  Shard helper for sub-epoch validation
 # ─────────────────────────────────────────────────────────────────────
 def make_chunks(n_samples, chunk_frac):
-    """
-    Returns a list of index lists.  Each list is ~(chunk_frac * n_samples) long.
-    The final shard may be slightly larger to avoid a tiny leftover.
-    """
     chunk_size = max(1, int(math.floor(n_samples * chunk_frac)))
     perm       = torch.randperm(n_samples).tolist()
     chunks     = []
     for start in range(0, n_samples, chunk_size):
         end = min(start + chunk_size, n_samples)
-        # absorb tiny tail into last chunk
         if n_samples - end < chunk_size * 0.25 and chunks:
             chunks[-1].extend(perm[start:end])
         else:
@@ -224,88 +187,80 @@ def make_chunks(n_samples, chunk_frac):
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Main training function
+#  Main training loop
 # ─────────────────────────────────────────────────────────────────────
 def train(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg["weights_dir"], exist_ok=True)
-    print(f"Device: {device}")
+    print(f"Device       : {device}")
+    print(f"Data root    : {cfg['data_root']}")
+    print(f"Weights dir  : {cfg['weights_dir']}")
 
-    chunk_frac  = float(cfg["chunk_frac"])
-    chunked     = chunk_frac < 1.0
-    n_chunks    = math.ceil(1.0 / chunk_frac) if chunked else 1
+    chunk_frac = float(cfg["chunk_frac"])
+    chunked    = chunk_frac < 1.0
+    n_chunks   = math.ceil(1.0 / chunk_frac) if chunked else 1
 
-    train_ds = COCOTasksDataset(cfg["data_root"], split="train", grid_size=16)
-    val_ds   = COCOTasksDataset(cfg["data_root"], split="test",  grid_size=16)
+    train_ds = COCOTasksDataset(cfg["data_root"], split="train")
+    val_ds   = COCOTasksDataset(cfg["data_root"], split="test")
 
-    # Full val loader is reused every shard
     val_loader = DataLoader(
         val_ds, batch_size=cfg["batch"], shuffle=False,
         num_workers=cfg["num_workers"], pin_memory=True, collate_fn=custom_collate,
     )
-
-    # Standard full-epoch loader (used when chunked=False)
     full_train_loader = DataLoader(
         train_ds, batch_size=cfg["batch"], shuffle=True,
         num_workers=cfg["num_workers"], pin_memory=True, collate_fn=custom_collate,
     )
 
-    detector = YOLODetector(checkpoint=cfg["yolo_model"], device=device)
-    model    = SATAYViT_V6(
-        checkpoint=cfg["yolo_model"],
-        embed_dim=cfg["embed_dim"],
-    ).to(device)
+    model    = TORCA(checkpoint=cfg["yolo_weights"]).to(device)
+    detector = YOLODetector(yolo_or_checkpoint=model._shared_yolo, device=device)
 
-    criterion = lambda p, t: focal_loss(p, t, gamma=cfg["focal_gamma"], alpha=cfg["focal_alpha"])
     optimizer = build_optimizer(model, cfg["lr"], cfg["backbone_lr"])
 
-    latest_path = os.path.join(cfg["weights_dir"], "v6_latest.pt")
-    best_path   = os.path.join(cfg["weights_dir"], "v6_best.pt")
+    latest_path = os.path.join(cfg["weights_dir"], "torca_latest.pt")
+    best_path   = os.path.join(cfg["weights_dir"], "torca_best.pt")
 
     start_epoch   = 0
     best_val      = float("inf")
-    train_history = []   # one entry per shard (or per epoch if not chunked)
+    train_history = []
     val_history   = []
-    step_labels   = []   # e.g. "E1.2/5"
+    step_labels   = []
 
     if os.path.exists(latest_path):
-        print(f"\nResuming from: {latest_path}")
+        print(f"\nResuming from {latest_path}")
         ckpt = torch.load(latest_path, map_location=device)
         model.load_state_dict(ckpt["state_dict"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt.get("full_epoch", ckpt.get("epoch", 0))
+        start_epoch = ckpt.get("full_epoch", 0)
         best_val    = ckpt.get("val_loss", float("inf"))
         hist_path   = os.path.join(cfg["weights_dir"], "training_history.json")
         if os.path.exists(hist_path):
             with open(hist_path) as f:
                 h = json.load(f)
             train_history = h.get("train", [])
-            val_history   = h.get("val",   [])
+            val_history   = h.get("val", [])
             step_labels   = h.get("labels", [])
             best_val      = h.get("best_val_loss", best_val)
-        print(f"Resuming from full-epoch {start_epoch}, best val loss {best_val:.4f}")
+        print(f"Resuming from epoch {start_epoch}, best val {best_val:.4f}")
 
     freeze_epochs = cfg["freeze_epochs"]
     if start_epoch < freeze_epochs:
         set_backbone_grad(model, False)
-        print(f"Backbone frozen for first {freeze_epochs} full epochs.")
+        print(f"Backbone frozen for first {freeze_epochs} epochs.")
 
     if chunked:
-        print(f"Chunked mode: {chunk_frac*100:.0f}% shards "
-              f"({n_chunks} shards/epoch, validating after each shard)")
+        print(f"Sub-epoch mode: {chunk_frac*100:.0f}% shards "
+              f"({n_chunks} shards/epoch, validating after each)")
     else:
-        print("Standard full-epoch mode.")
+        print("Full-epoch mode.")
 
     for full_epoch in range(start_epoch, cfg["epochs"]):
 
         if full_epoch == freeze_epochs:
             set_backbone_grad(model, True)
-            print(f"\nFull epoch {full_epoch+1}: backbone unfrozen.")
+            print(f"\nEpoch {full_epoch+1}: backbone unfrozen.")
 
-        if chunked:
-            shards = make_chunks(len(train_ds), chunk_frac)
-        else:
-            shards = [None]   # sentinel → use full_train_loader
+        shards = make_chunks(len(train_ds), chunk_frac) if chunked else [None]
 
         for shard_idx, shard_indices in enumerate(shards):
             label = (f"E{full_epoch+1}.{shard_idx+1}/{len(shards)}"
@@ -313,26 +268,17 @@ def train(cfg):
             print(f"\n── {label} ──")
 
             if chunked:
-                shard_loader = DataLoader(
+                loader = DataLoader(
                     Subset(train_ds, shard_indices),
                     batch_size=cfg["batch"], shuffle=True,
                     num_workers=cfg["num_workers"], pin_memory=True,
                     collate_fn=custom_collate,
                 )
-                train_loss = run_epoch(
-                    model, detector, shard_loader, criterion, optimizer,
-                    cfg, device, train=True,
-                )
             else:
-                train_loss = run_epoch(
-                    model, detector, full_train_loader, criterion, optimizer,
-                    cfg, device, train=True,
-                )
+                loader = full_train_loader
 
-            val_loss = run_epoch(
-                model, detector, val_loader, criterion, optimizer,
-                cfg, device, train=False,
-            )
+            train_loss = run_epoch(model, detector, loader, optimizer, cfg, device, train=True)
+            val_loss   = run_epoch(model, detector, val_loader, optimizer, cfg, device, train=False)
 
             train_history.append(train_loss)
             val_history.append(val_loss)
@@ -362,34 +308,43 @@ def train(cfg):
                     "best_val_loss": best_val,
                 }, f, indent=2)
 
-    plot_path = plot_training_losses(train_history, val_history, save_dir=cfg["weights_dir"])
-    print(f"\nDone. Best val loss: {best_val:.4f}")
-    print(f"Best checkpoint : {best_path}")
-    print(f"Loss curve      : {plot_path}")
+    plot_path = plot_training_losses(
+        train_history, val_history,
+        labels=step_labels,
+        save_dir=cfg["weights_dir"],
+    )
+    print(f"\nDone. Best val loss : {best_val:.4f}")
+    print(f"Best checkpoint    : {best_path}")
+    print(f"Loss curve         : {plot_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  CLI
 # ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root",     type=str,   default=DEFAULTS["data_root"])
-    parser.add_argument("--weights-dir",   type=str,   default=DEFAULTS["weights_dir"])
-    parser.add_argument("--yolo-model",    type=str,   default=DEFAULTS["yolo_model"])
+    parser = argparse.ArgumentParser(
+        description="Train TORCA on COCO-Tasks data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--data-root",     type=str,   default=DEFAULTS["data_root"],
+                        help="Root of the preprocessed COCO-Tasks dataset (contains train/ and test/).")
+    parser.add_argument("--weights-dir",   type=str,   default=DEFAULTS["weights_dir"],
+                        help="Directory to save checkpoints and training history.")
+    parser.add_argument("--yolo-weights",  type=str,   default=DEFAULTS["yolo_weights"],
+                        help="Path to yolo11n.pt (detector weights, stays frozen).")
     parser.add_argument("--epochs",        type=int,   default=DEFAULTS["epochs"])
     parser.add_argument("--batch",         type=int,   default=DEFAULTS["batch"])
-    parser.add_argument("--lr",            type=float, default=DEFAULTS["lr"])
-    parser.add_argument("--backbone-lr",   type=float, default=DEFAULTS["backbone_lr"])
-    parser.add_argument("--freeze-epochs", type=int,   default=DEFAULTS["freeze_epochs"])
+    parser.add_argument("--lr",            type=float, default=DEFAULTS["lr"],
+                        help="Learning rate for scorer heads.")
+    parser.add_argument("--backbone-lr",   type=float, default=DEFAULTS["backbone_lr"],
+                        help="Learning rate for FPN backbone (lower than head LR).")
+    parser.add_argument("--freeze-epochs", type=int,   default=DEFAULTS["freeze_epochs"],
+                        help="Number of epochs to keep the FPN backbone frozen.")
     parser.add_argument("--num-workers",   type=int,   default=DEFAULTS["num_workers"])
-    parser.add_argument("--embed-dim",     type=int,   default=DEFAULTS["embed_dim"])
-    parser.add_argument("--iou-threshold", type=float, default=DEFAULTS["iou_threshold"])
+    parser.add_argument("--iou-threshold", type=float, default=DEFAULTS["iou_threshold"],
+                        help="IoU threshold for assigning positive training labels.")
     parser.add_argument("--chunk-frac",    type=float, default=DEFAULTS["chunk_frac"],
-                        help="Fraction of training data per shard (0.1–1.0). "
-                             "Values <1 enable sub-epoch validation.")
-    parser.add_argument("--focal-gamma",   type=float, default=DEFAULTS["focal_gamma"],
-                        help="Focal loss focusing exponent (0=plain BCE, 2=standard).")
-    parser.add_argument("--focal-alpha",   type=float, default=DEFAULTS["focal_alpha"],
-                        help="Focal loss prior weight for positives (0.25 standard).")
+                        help="Fraction of training data per shard (e.g. 0.25 → 4 shards/epoch). "
+                             "Set to 1.0 for standard full-epoch mode.")
     args = parser.parse_args()
     train({**DEFAULTS, **{k.replace("-", "_"): v for k, v in vars(args).items()}})

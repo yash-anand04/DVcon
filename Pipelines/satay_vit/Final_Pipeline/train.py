@@ -51,8 +51,6 @@ DEFAULTS = dict(
     embed_dim      = 256,
     iou_threshold  = 0.5,
     chunk_frac     = 0.2,   # 1.0 = standard full-epoch mode
-    focal_gamma    = 2.0,
-    focal_alpha    = 0.25,
 )
 
 
@@ -89,13 +87,9 @@ def load_pil_images(paths):
 def build_targets(batch, det_results, mask, iou_threshold, device):
     """
     Returns
-      targets [B, maxN] : soft IoU score clamped to [0,1] for each detected box
-                          (boxes below iou_threshold get 0; above get their exact IoU)
+      targets [B, maxN] : hard 0/1 label per detected box
+                          (1 if best IoU to any preferred GT >= iou_threshold)
       valid   [B, maxN] : True where position is a real detection (not padding)
-
-    Soft targets give the model a gradient signal that distinguishes a
-    near-perfect overlap (IoU=0.95) from a borderline positive (IoU=0.51),
-    smoothing the loss landscape compared to hard 0/1 labels.
     """
     B    = len(det_results)
     maxN = mask.shape[1]
@@ -120,29 +114,9 @@ def build_targets(batch, det_results, mask, iou_threshold, device):
         det_xyxy = boxes_b[:n_b].to(device)
         ious     = pairwise_iou_xyxy(det_xyxy, preferred_xyxy)
         max_iou  = ious.max(dim=1).values          # [n_b]  best IoU to any preferred GT
-        # Zero out boxes below threshold; keep exact IoU for those above
-        soft = max_iou * (max_iou >= iou_threshold).float()
-        targets[b, :n_b] = soft
+        targets[b, :n_b] = (max_iou >= iou_threshold).float()
 
     return targets, valid
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Focal loss
-# ─────────────────────────────────────────────────────────────────────
-def focal_loss(pred, target, gamma=2.0, alpha=0.25):
-    """
-    Binary focal loss.  Reduces the contribution of easy negatives
-    (the ~14 clearly-wrong boxes per image) so gradients focus on
-    hard / borderline examples.
-
-    alpha  : prior weight for the positive class (0.25 is standard)
-    gamma  : focusing exponent; 0 → plain BCE, 2 is standard
-    """
-    bce   = torch.nn.functional.binary_cross_entropy(pred, target, reduction="none")
-    p_t   = pred * target + (1 - pred) * (1 - target)
-    alpha_t = alpha * target + (1 - alpha) * (1 - target)
-    return (alpha_t * (1 - p_t) ** gamma * bce).mean()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -256,7 +230,7 @@ def train(cfg):
         embed_dim=cfg["embed_dim"],
     ).to(device)
 
-    criterion = lambda p, t: focal_loss(p, t, gamma=cfg["focal_gamma"], alpha=cfg["focal_alpha"])
+    criterion = torch.nn.functional.binary_cross_entropy
     optimizer = build_optimizer(model, cfg["lr"], cfg["backbone_lr"])
 
     latest_path = os.path.join(cfg["weights_dir"], "v6_latest.pt")
@@ -387,9 +361,5 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-frac",    type=float, default=DEFAULTS["chunk_frac"],
                         help="Fraction of training data per shard (0.1–1.0). "
                              "Values <1 enable sub-epoch validation.")
-    parser.add_argument("--focal-gamma",   type=float, default=DEFAULTS["focal_gamma"],
-                        help="Focal loss focusing exponent (0=plain BCE, 2=standard).")
-    parser.add_argument("--focal-alpha",   type=float, default=DEFAULTS["focal_alpha"],
-                        help="Focal loss prior weight for positives (0.25 standard).")
     args = parser.parse_args()
     train({**DEFAULTS, **{k.replace("-", "_"): v for k, v in vars(args).items()}})
